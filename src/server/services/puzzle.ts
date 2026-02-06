@@ -101,6 +101,9 @@ export async function getDailyPuzzle(date: Date = new Date()): Promise<Puzzle> {
   // Generate new puzzle using hash-based post selection
   const puzzleNumber = await getPuzzleNumber();
   
+  // Normalize date for seed generation (needed regardless of source)
+  const normalizedDate = new Date(dateString + 'T00:00:00Z');
+  
   // Try to fetch from Reddit API first, fallback to database
   let source: RedditPost;
   try {
@@ -117,7 +120,6 @@ export async function getDailyPuzzle(date: Date = new Date()): Promise<Puzzle> {
   } catch (error) {
     console.error('Error fetching from Reddit, using database:', error);
     // Fallback to database
-    const normalizedDate = new Date(dateString + 'T00:00:00Z');
     source = await getDailyPost(normalizedDate);
   }
 

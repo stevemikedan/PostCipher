@@ -122,6 +122,7 @@ export async function getDailyPost(date: Date = new Date()): Promise<RedditPost>
 /**
  * Get a random post for practice mode
  * Optionally filter by subreddit
+ * Uses timestamp-based seed to ensure variety between requests
  */
 export async function getRandomPost(subreddit?: string): Promise<RedditPost> {
   await initializePostDatabase();
@@ -144,7 +145,14 @@ export async function getRandomPost(subreddit?: string): Promise<RedditPost> {
     throw new Error('No posts available in database');
   }
   
-  const randomIndex = Math.floor(Math.random() * posts.length);
+  // Use timestamp-based seed for better variety (changes every second)
+  // This ensures different puzzles even when there are only a few options
+  const timestampSeed = Math.floor(Date.now() / 1000); // Changes every second
+  const seedHash = hashString(`practice-${timestampSeed}-${subreddit || 'all'}`);
+  const randomIndex = seedHash % posts.length;
+  
+  console.log(`Selected post ${randomIndex} from ${posts.length} posts${subreddit ? ` for ${subreddit}` : ''} (seed: ${seedHash})`);
+  
   return posts[randomIndex];
 }
 

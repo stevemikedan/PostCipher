@@ -4,6 +4,12 @@ import { reddit } from '@devvit/web/server';
 import type { RedditPost } from '../../shared/types/puzzle';
 
 /**
+ * Enable mock mode for testing Reddit API behavior
+ * Set USE_MOCK_REDDIT=true in environment or change this to true
+ */
+const USE_MOCK_REDDIT = process.env.USE_MOCK_REDDIT === 'true' || false;
+
+/**
  * Content filter configuration
  */
 const CONTENT_FILTERS = {
@@ -42,6 +48,19 @@ const CONTENT_FILTERS = {
 export function getWhitelistedSubreddits(): string[] {
   return Array.from(CONTENT_FILTERS.whitelistedSubreddits).map((sub) => `r/${sub}`);
 };
+
+/**
+ * Hash a string to a number (deterministic)
+ */
+function hashString(str: string): number {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = (hash << 5) - hash + char;
+    hash = hash & hash; // Convert to 32-bit integer
+  }
+  return Math.abs(hash);
+}
 
 /**
  * Check if text meets content requirements
@@ -92,6 +111,12 @@ function isAllowedSubreddit(subreddit: string): boolean {
  * Fetches from multiple subreddits and filters for cryptogram-appropriate content
  */
 export async function fetchTrendingPosts(limit: number = 50): Promise<RedditPost[]> {
+  // Use mock data if mock mode is enabled
+  if (USE_MOCK_REDDIT) {
+    const { getMockTrendingPosts } = await import('./reddit-mock');
+    return getMockTrendingPosts(limit);
+  }
+
   try {
     const subreddits = Array.from(CONTENT_FILTERS.whitelistedSubreddits);
     const allPosts: RedditPost[] = [];
@@ -175,6 +200,17 @@ export async function fetchTrendingPosts(limit: number = 50): Promise<RedditPost
  * Falls back to curated library if Reddit API unavailable
  */
 export async function fetchRandomPost(subreddit?: string): Promise<RedditPost | null> {
+  // Use mock data if mock mode is enabled
+  if (USE_MOCK_REDDIT) {
+    const { getRandomMockPost } = await import('./reddit-mock');
+    const mockPost = getRandomMockPost(subreddit);
+    if (mockPost) {
+      console.log(`[MOCK MODE] Using mock post from ${mockPost.subreddit}`);
+      return mockPost;
+    }
+    // If no mock post found for subreddit, fall through to curated library
+  }
+
   try {
     let posts: RedditPost[] = [];
 
@@ -253,7 +289,11 @@ export async function fetchRandomPost(subreddit?: string): Promise<RedditPost | 
         );
         
         if (matchingQuotes.length > 0) {
-          const randomQuote = matchingQuotes[Math.floor(Math.random() * matchingQuotes.length)];
+          // Use timestamp-based seed for variety
+          const timestampSeed = Math.floor(Date.now() / 1000);
+          const seedHash = hashString(`curated-${timestampSeed}-${normalizedSubreddit}`);
+          const randomIndex = seedHash % matchingQuotes.length;
+          const randomQuote = matchingQuotes[randomIndex];
           return {
             ...randomQuote,
             id: `curated-${Date.now()}-${Math.random()}`,
@@ -266,9 +306,13 @@ export async function fetchRandomPost(subreddit?: string): Promise<RedditPost | 
       return fallbackPost;
     }
   
-    const randomIndex = Math.floor(Math.random() * posts.length);
+    // Use timestamp-based seed for better variety (changes every second)
+    // This ensures different puzzles even when there are only a few options
+    const timestampSeed = Math.floor(Date.now() / 1000);
+    const seedHash = hashString(`reddit-${timestampSeed}-${subreddit || 'all'}`);
+    const randomIndex = seedHash % posts.length;
     const selectedPost = posts[randomIndex];
-    console.log(`Selected post from ${selectedPost.subreddit}: "${selectedPost.title.substring(0, 50)}..."`);
+    console.log(`Selected post ${randomIndex} from ${posts.length} posts from ${selectedPost.subreddit}: "${selectedPost.title.substring(0, 50)}..."`);
     return selectedPost;
   } catch (error) {
     console.error('Error fetching random post:', error);

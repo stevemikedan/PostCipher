@@ -212,6 +212,27 @@ router.get<unknown, { subreddits: string[] } | ErrorResponse>(
   }
 );
 
+// Test endpoint to check mock mode status
+router.get<unknown, {
+  mockModeEnabled: boolean;
+  message: string;
+  instructions?: string;
+}>(
+  '/api/test/mock-mode',
+  async (_req, res): Promise<void> => {
+    const mockModeEnabled = process.env.USE_MOCK_REDDIT === 'true';
+    res.json({
+      mockModeEnabled,
+      message: mockModeEnabled 
+        ? 'Mock mode is enabled - Reddit API calls will use mock data'
+        : 'Mock mode is disabled - using real Reddit API (or falling back to curated library)',
+      instructions: mockModeEnabled
+        ? undefined
+        : 'To enable mock mode, set USE_MOCK_REDDIT=true in your environment variables',
+    });
+  }
+);
+
 // Test endpoint to check if Reddit API is allowlisted
 router.get<unknown, {
   allowlisted: boolean;

@@ -23,7 +23,7 @@
   "permissions": {
     "http": {
       "enable": true,
-      "domains": ["reddit.com", "www.reddit.com"]
+      "domains": ["reddit.com", "www.reddit.com", "old.reddit.com"]
     }
   },
   "menu": {

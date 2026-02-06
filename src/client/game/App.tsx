@@ -109,7 +109,7 @@ export const App = () => {
     const words = puzzle.cipherText.split(' ');
 
     return (
-      <div className="flex flex-wrap justify-center gap-x-1 sm:gap-x-2 md:gap-x-4 gap-y-3 sm:gap-y-4 md:gap-y-6 p-2 sm:p-4 max-w-full">
+      <div className="flex flex-wrap justify-center gap-x-4 sm:gap-x-6 md:gap-x-8 gap-y-3 sm:gap-y-4 md:gap-y-6 p-2 sm:p-4 w-full">
         {words.map((word, wi) => (
           <div key={wi} className="flex gap-0.5 sm:gap-1">
             {word.split('').map((char, ci) => {
@@ -152,7 +152,7 @@ export const App = () => {
                     }
                   }}
                   className={`
-                    w-7 h-12 sm:w-8 sm:h-14 md:w-10 md:h-16 flex flex-col items-center justify-center rounded-md sm:rounded-lg cursor-pointer
+                    w-6 h-10 sm:w-7 sm:h-12 md:w-8 md:h-14 lg:w-10 lg:h-16 flex flex-col items-center justify-center rounded-md sm:rounded-lg cursor-pointer
                     transition-all duration-150 select-none relative
                     ${
                       isSelected
@@ -173,13 +173,13 @@ export const App = () => {
                   }
                 >
                   <span
-                    className={`text-xs sm:text-sm md:text-lg font-mono font-bold ${isSelected ? 'text-white' : 'text-zinc-400'}`}
+                    className={`text-[10px] sm:text-xs md:text-sm lg:text-lg font-mono font-bold ${isSelected ? 'text-white' : 'text-zinc-400'}`}
                   >
                     {char}
                   </span>
                   <span
                     className={`
-                    text-xs sm:text-sm md:text-lg font-bold h-4 sm:h-5 md:h-6
+                    text-[10px] sm:text-xs md:text-sm lg:text-lg font-bold h-3 sm:h-4 md:h-5 lg:h-6
                     ${isHint ? 'text-blue-400' : isCorrect ? 'text-emerald-400' : 'text-white'}
                   `}
                   >
@@ -468,8 +468,8 @@ export const App = () => {
         )}
 
         {/* Puzzle Grid */}
-        <div className="bg-zinc-900/50 rounded-xl border border-zinc-800 mb-4 overflow-x-auto -mx-2 sm:mx-0">
-          <div className="min-w-fit px-2 sm:px-0">
+        <div className="bg-zinc-900/50 rounded-xl border border-zinc-800 mb-4 overflow-hidden -mx-2 sm:mx-0">
+          <div className="w-full px-2 sm:px-4 py-2 sm:py-4">
             {renderPuzzle()}
           </div>
         </div>
