@@ -444,6 +444,73 @@ export const CURATED_QUOTES: Array<Omit<RedditPost, 'id' | 'permalink' | 'create
     author: 'u/KindnessSpreader',
     upvotes: 52300,
   },
+  // Extra variety for subreddits that had only one quote (so "New Puzzle" gives different posts when API is down)
+  {
+    title: 'What is a skill that took you years to learn but was totally worth it',
+    subreddit: 'r/AskReddit',
+    author: 'u/SkillSeeker',
+    upvotes: 41200,
+  },
+  {
+    title: 'Today I learned that the shortest war in history lasted thirty eight minutes',
+    subreddit: 'r/todayilearned',
+    author: 'u/HistoryNerd',
+    upvotes: 32100,
+  },
+  {
+    title: 'I told my wife she was drawing her eyebrows too high she looked surprised',
+    subreddit: 'r/funny',
+    author: 'u/DadJokesForever',
+    upvotes: 28900,
+  },
+  {
+    title: 'Explain like I am five why does the moon change shape in the sky',
+    subreddit: 'r/explainlikeimfive',
+    author: 'u/CuriousKid',
+    upvotes: 25600,
+  },
+  {
+    title: 'You should know that honey never spoils and can last for thousands of years',
+    subreddit: 'r/YouShouldKnow',
+    author: 'u/FactChecker',
+    upvotes: 19800,
+  },
+  {
+    title: 'This mildly interesting photo shows what happens when you leave bread in the sun',
+    subreddit: 'r/mildlyinteresting',
+    author: 'u/PhotoFan',
+    upvotes: 22400,
+  },
+  {
+    title: 'Sometimes the smallest step in the right direction ends up being the biggest step',
+    subreddit: 'r/wholesomememes',
+    author: 'u/PositiveVibes',
+    upvotes: 36700,
+  },
+  {
+    title: 'The unexamined life is not worth living according to ancient philosophy',
+    subreddit: 'r/Philosophy',
+    author: 'u/ThinkDeep',
+    upvotes: 15200,
+  },
+  {
+    title: 'Deep thoughts often come when we stop filling every moment with noise',
+    subreddit: 'r/DeepThoughts',
+    author: 'u/QuietMind',
+    upvotes: 18300,
+  },
+  {
+    title: 'Unpopular opinion but sometimes being alone is better than being with the wrong people',
+    subreddit: 'r/UnpopularOpinion',
+    author: 'u/HonestTake',
+    upvotes: 22100,
+  },
+  {
+    title: 'True off my chest sometimes I wonder if we are all just pretending to be okay',
+    subreddit: 'r/TrueOffMyChest',
+    author: 'u/RealTalk',
+    upvotes: 19400,
+  },
 ];
 
 /**

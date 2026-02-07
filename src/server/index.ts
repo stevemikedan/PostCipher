@@ -9,6 +9,10 @@ import type {
   SubmitScoreResponse,
   GenerateShareRequest,
   GenerateShareResponse,
+  GetScoreHistoryResponse,
+  SaveProgressRequest,
+  SaveProgressResponse,
+  PlayHistoryEntry,
   ErrorResponse,
 } from '../shared/types/api';
 import { redis, reddit, createServer, context, getServerPort } from '@devvit/web/server';
@@ -140,24 +144,46 @@ router.post('/internal/menu/post-create', async (_req, res): Promise<void> => {
 
 // ===== Puzzle API Endpoints =====
 
+const MAX_HISTORY_ENTRIES = 100;
+
 router.get<unknown, GetDailyPuzzleResponse | ErrorResponse>(
   '/api/puzzle/daily',
   async (_req, res): Promise<void> => {
     try {
-      // Initialize database if needed (lazy initialization)
       await initializePostDatabase();
-      
-      // Always use current UTC date to ensure daily changes
       const today = new Date();
       const puzzle = await getDailyPuzzle(today);
       const puzzleNumber = parseInt((await redis.get('puzzle:number')) || '1', 10);
 
-      console.log(`Serving daily puzzle for ${puzzle.date} (puzzle #${puzzleNumber})`);
+      let completed: boolean | undefined;
+      let completedScore: GetDailyPuzzleResponse['completedScore'];
+
+      try {
+        const username = (await reddit.getCurrentUsername()) || 'anonymous';
+        const scoreKey = `score:${puzzle.id}:${username}`;
+        const stored = await redis.get(scoreKey);
+        if (stored) {
+          const data = JSON.parse(stored);
+          completed = true;
+          completedScore = {
+            score: data.score,
+            time: data.time,
+            hintsUsed: data.hintsUsed,
+            mistakes: data.mistakes ?? 0,
+            puzzleId: data.puzzleId,
+            date: data.date,
+            username: data.username,
+          };
+        }
+      } catch (e) {
+        // Ignore; completed stays undefined
+      }
 
       res.json({
         type: 'daily-puzzle',
         puzzle,
         puzzleNumber,
+        ...(completed && completedScore ? { completed, completedScore } : {}),
       });
     } catch (error) {
       console.error('Error getting daily puzzle:', error);
@@ -173,11 +199,13 @@ router.get<unknown, GetPracticePuzzleResponse | ErrorResponse>(
   '/api/puzzle/practice',
   async (req, res): Promise<void> => {
     try {
-      // Initialize database if needed (lazy initialization)
       await initializePostDatabase();
-      
+
       const subreddit = req.query.subreddit as string | undefined;
-      const puzzle = await getPracticePuzzle(subreddit);
+      const seedParam = req.query.seed as string | undefined;
+      const requestSeed =
+        seedParam && !Number.isNaN(Number(seedParam)) ? Number(seedParam) : undefined;
+      const puzzle = await getPracticePuzzle(subreddit, requestSeed);
 
       res.json({
         type: 'practice-puzzle',
@@ -233,80 +261,155 @@ router.get<unknown, {
   }
 );
 
-// Test endpoint to check if Reddit API is allowlisted
+// Test endpoint: Devvit Reddit API (no HTTP allowlist) then HTTP fallback
 router.get<unknown, {
-  allowlisted: boolean;
+  source: 'devvit' | 'http' | 'none';
   status: string;
   message: string;
   details?: {
-    statusCode?: number;
     postsFound?: number;
+    sampleTitles?: string[];
+    subreddit?: string;
     error?: string;
   };
 }>(
   '/api/test/reddit-api',
   async (_req, res): Promise<void> => {
     try {
-      console.log('Testing Reddit API allowlisting...');
-      
-      // Try to fetch from a simple, reliable Reddit endpoint
-      const testUrl = 'https://www.reddit.com/r/Showerthoughts/hot.json?limit=5';
-      const response = await fetch(testUrl, {
-        headers: {
-          'User-Agent': 'PostCipher/1.0',
-        },
-      });
-
-      const statusCode = response.status;
-      const isSuccess = response.ok;
-
-      if (isSuccess) {
-        const data = await response.json();
-        const posts = data.data?.children || [];
-        
-        console.log(`✅ Reddit API is allowlisted! Fetched ${posts.length} posts`);
-        
+      const { fetchTrendingPosts } = await import('./services/reddit');
+      const posts = await fetchTrendingPosts(10);
+      if (posts.length > 0) {
+        const source = posts[0] ? 'devvit' : 'http'; // fetchTrendingPosts tries Devvit first
+        console.log(`✅ Reddit API working: ${posts.length} posts (source: ${source})`);
         res.json({
-          allowlisted: true,
+          source: 'devvit',
           status: 'success',
-          message: `Reddit API is allowlisted and working! Successfully fetched ${posts.length} posts.`,
+          message: `Reddit API working! Fetched ${posts.length} posts (Devvit API preferred).`,
           details: {
-            statusCode,
             postsFound: posts.length,
+            sampleTitles: posts.slice(0, 5).map((p) => p.title.substring(0, 60)),
+            subreddit: posts[0]?.subreddit,
           },
         });
-      } else {
-        // 403 Forbidden typically means not allowlisted
-        // Other errors might be temporary
-        const errorText = statusCode === 403 
-          ? 'Domain not allowlisted (403 Forbidden)'
-          : `HTTP ${statusCode} error`;
-        
-        console.log(`❌ Reddit API test failed: ${errorText}`);
-        
-        res.json({
-          allowlisted: false,
-          status: 'failed',
-          message: `Reddit API is not accessible: ${errorText}`,
-          details: {
-            statusCode,
-            error: errorText,
-          },
-        });
+        return;
       }
+      res.json({
+        source: 'none',
+        status: 'no_posts',
+        message: 'No posts returned (Devvit API and HTTP fallback returned empty).',
+        details: { postsFound: 0 },
+      });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      const is403 = errorMessage.includes('403') || errorMessage.includes('Forbidden');
-      
       console.log(`❌ Reddit API test error: ${errorMessage}`);
-      
       res.json({
-        allowlisted: false,
+        source: 'none',
         status: 'error',
-        message: `Error testing Reddit API: ${errorMessage}`,
-        details: {
-          error: errorMessage,
-        },
+        message: `Error: ${errorMessage}`,
+        details: { error: errorMessage },
+      });
+    }
+  }
+);
+
+// Test endpoint: fetch by subreddit and sort (hot / new / top / rising)
+router.get<unknown, {
+  status: string;
+  source: string;
+  postsFound: number;
+  subreddit: string;
+  sort?: string;
+  sampleTitles?: string[];
+  error?: string;
+}>(
+  '/api/test/reddit-by-subreddit',
+  async (req, res): Promise<void> => {
+    try {
+      const subreddit = (req.query.subreddit as string) || 'Showerthoughts';
+      const sort = ((req.query.sort as string) || 'hot') as 'hot' | 'new' | 'top' | 'rising';
+      const { fetchPostsForSubreddit } = await import('./services/reddit');
+      const posts = await fetchPostsForSubreddit(subreddit, 15, sort);
+      res.json({
+        status: posts.length > 0 ? 'success' : 'no_posts',
+        source: 'devvit_or_http',
+        postsFound: posts.length,
+        subreddit: `r/${subreddit.replace(/^r\//, '')}`,
+        sort,
+        sampleTitles: posts.slice(0, 5).map((p) => p.title.substring(0, 60)),
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      res.json({
+        status: 'error',
+        source: 'none',
+        postsFound: 0,
+        subreddit: (req.query.subreddit as string) || 'Showerthoughts',
+        error: errorMessage,
+      });
+    }
+  }
+);
+
+/** Build canonical Reddit URL for a post (used for "View original" and history). */
+function postToRedditUrl(post: { id: string; permalink?: string; subreddit?: string }): string {
+  if (post.permalink) {
+    const path = post.permalink.startsWith('/') ? post.permalink : `/${post.permalink}`;
+    return `https://www.reddit.com${path}`;
+  }
+  const sub = (post.subreddit || '').replace(/^r\//, '') || 'reddit';
+  return `https://www.reddit.com/r/${sub}/comments/${post.id}`;
+}
+
+// Diagnostic: verify API → sync → library flow and that each library post has a correct Reddit link
+router.get<unknown, {
+  ok: boolean;
+  message: string;
+  apiFetched: number;
+  syncNewAdded: number;
+  libraryTotal: number;
+  sampleFromLibrary: Array<{ id: string; title: string; subreddit: string; redditUrl: string; hasPermalink: boolean }>;
+  error?: string;
+}>(
+  '/api/test/sync-and-library',
+  async (req, res): Promise<void> => {
+    try {
+      const subreddit = (req.query.subreddit as string) || 'Showerthoughts';
+      const { fetchPostsForSubreddit } = await import('./services/reddit');
+      const { syncRedditPostsToLibrary, getAllPosts } = await import('./services/post-database');
+
+      const fetched = await fetchPostsForSubreddit(subreddit, 20, 'hot');
+      const newAdded = fetched.length > 0 ? await syncRedditPostsToLibrary(fetched) : 0;
+      const allPosts = await getAllPosts();
+      const sample = allPosts.slice(0, 8).map((p) => ({
+        id: p.id,
+        title: (p.title || '').substring(0, 50),
+        subreddit: p.subreddit || '',
+        redditUrl: postToRedditUrl(p),
+        hasPermalink: Boolean(p.permalink),
+      }));
+
+      res.json({
+        ok: true,
+        message:
+          fetched.length > 0
+            ? `Fetched ${fetched.length} from API, synced (${newAdded} new). Library has ${allPosts.length} posts.`
+            : `No posts from API for r/${subreddit}. Library has ${allPosts.length} posts (curated/previous sync).`,
+        apiFetched: fetched.length,
+        syncNewAdded: newAdded,
+        libraryTotal: allPosts.length,
+        sampleFromLibrary: sample,
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error('Sync-and-library diagnostic error:', error);
+      res.json({
+        ok: false,
+        message: 'Diagnostic failed',
+        apiFetched: 0,
+        syncNewAdded: 0,
+        libraryTotal: 0,
+        sampleFromLibrary: [],
+        error: errorMessage,
       });
     }
   }
@@ -316,7 +419,7 @@ router.post<unknown, ValidatePuzzleResponse | ErrorResponse, ValidatePuzzleReque
   '/api/puzzle/validate',
   async (req, res): Promise<void> => {
     try {
-      const { puzzleId, userMappings } = req.body;
+      const { puzzleId, userMappings, seed, cipherText } = req.body;
 
       if (!puzzleId || !userMappings) {
         res.status(400).json({
@@ -326,18 +429,23 @@ router.post<unknown, ValidatePuzzleResponse | ErrorResponse, ValidatePuzzleReque
         return;
       }
 
-      // Get puzzle from cache or generate
-      const dateString = new Date().toISOString().split('T')[0];
-      const cacheKey = `puzzle:daily:${dateString}`;
-      let puzzle = await redis.get(cacheKey);
-      
-      if (!puzzle) {
-        // Try to get daily puzzle
-        const dailyPuzzle = await getDailyPuzzle();
-        puzzle = JSON.stringify(dailyPuzzle);
+      let puzzleData: { cipherText: string; seed: string };
+
+      if (puzzleId.startsWith('practice-') && seed && cipherText) {
+        // Practice puzzles are not cached; client sends seed + cipherText for validation
+        puzzleData = { cipherText, seed };
+      } else {
+        // Daily puzzle: get from cache or generate
+        const dateString = new Date().toISOString().split('T')[0];
+        const cacheKey = `puzzle:daily:${dateString}`;
+        let puzzle = await redis.get(cacheKey);
+        if (!puzzle) {
+          const dailyPuzzle = await getDailyPuzzle();
+          puzzle = JSON.stringify(dailyPuzzle);
+        }
+        puzzleData = JSON.parse(puzzle);
       }
 
-      const puzzleData = JSON.parse(puzzle);
       const validation = validatePuzzle(puzzleData, userMappings);
 
       res.json({
@@ -360,7 +468,7 @@ router.post<unknown, SubmitScoreResponse | ErrorResponse, SubmitScoreRequest>(
   '/api/score/submit',
   async (req, res): Promise<void> => {
     try {
-      const { puzzleId, time, hintsUsed, mistakes, mode } = req.body;
+      const { puzzleId, time, hintsUsed, mistakes, mode, postLink, subreddit, title } = req.body;
 
       if (!puzzleId) {
         res.status(400).json({
@@ -372,6 +480,7 @@ router.post<unknown, SubmitScoreResponse | ErrorResponse, SubmitScoreRequest>(
 
       const username = (await reddit.getCurrentUsername()) || 'anonymous';
       const score = calculateScore(time, hintsUsed, mistakes);
+      const date = new Date().toISOString().split('T')[0];
 
       const scoreData = {
         score,
@@ -379,15 +488,34 @@ router.post<unknown, SubmitScoreResponse | ErrorResponse, SubmitScoreRequest>(
         hintsUsed,
         mistakes,
         puzzleId,
-        date: new Date().toISOString().split('T')[0],
+        date,
         username,
       };
 
-      // Store score in Redis (for potential leaderboard) - only for daily mode
       if (mode === 'daily') {
         const scoreKey = `score:${puzzleId}:${username}`;
         await redis.set(scoreKey, JSON.stringify(scoreData));
       }
+
+      // Append to play history (for success rate, past plays, view original posts)
+      const historyKey = `history:${username}`;
+      const entry: PlayHistoryEntry = {
+        puzzleId,
+        date,
+        score,
+        time,
+        hintsUsed,
+        mistakes: mistakes ?? 0,
+        mode,
+        postLink: postLink ?? '',
+        subreddit: subreddit ?? '',
+        title: title ?? '',
+      };
+      const existingJson = await redis.get(historyKey);
+      const history: PlayHistoryEntry[] = existingJson ? JSON.parse(existingJson) : [];
+      history.unshift(entry);
+      const trimmed = history.slice(0, MAX_HISTORY_ENTRIES);
+      await redis.set(historyKey, JSON.stringify(trimmed));
 
       res.json({
         type: 'score-submitted',
@@ -398,6 +526,69 @@ router.post<unknown, SubmitScoreResponse | ErrorResponse, SubmitScoreRequest>(
       res.status(500).json({
         status: 'error',
         message: error instanceof Error ? error.message : 'Failed to submit score',
+      });
+    }
+  }
+);
+
+router.get<unknown, GetScoreHistoryResponse | ErrorResponse>(
+  '/api/score/history',
+  async (_req, res): Promise<void> => {
+    try {
+      const username = (await reddit.getCurrentUsername()) || 'anonymous';
+      const historyKey = `history:${username}`;
+      const json = await redis.get(historyKey);
+      const history: PlayHistoryEntry[] = json ? JSON.parse(json) : [];
+      res.json({ type: 'score-history', history });
+    } catch (error) {
+      console.error('Error getting score history:', error);
+      res.status(500).json({
+        status: 'error',
+        message: error instanceof Error ? error.message : 'Failed to get history',
+      });
+    }
+  }
+);
+
+router.post<unknown, SaveProgressResponse | ErrorResponse, SaveProgressRequest>(
+  '/api/progress/save',
+  async (req, res): Promise<void> => {
+    try {
+      const { puzzleId, puzzle, userMappings, elapsedTime, hintsUsed, mistakes, mode, postLink, subreddit, title } = req.body;
+      if (!puzzleId || !puzzle) {
+        res.status(400).json({ status: 'error', message: 'puzzleId and puzzle are required' });
+        return;
+      }
+      const username = (await reddit.getCurrentUsername()) || 'anonymous';
+      const historyKey = `history:${username}`;
+      const date = new Date().toISOString().split('T')[0];
+      const entry: PlayHistoryEntry = {
+        puzzleId,
+        date,
+        score: 0,
+        time: elapsedTime,
+        hintsUsed: hintsUsed ?? 0,
+        mistakes: mistakes ?? 0,
+        mode,
+        postLink: postLink ?? '',
+        subreddit: subreddit ?? '',
+        title: title ?? '',
+        isInProgress: true,
+        savedPuzzle: puzzle,
+        userMappings: userMappings ?? {},
+        elapsedTime,
+      };
+      const existingJson = await redis.get(historyKey);
+      const history: PlayHistoryEntry[] = existingJson ? JSON.parse(existingJson) : [];
+      history.unshift(entry);
+      const trimmed = history.slice(0, MAX_HISTORY_ENTRIES);
+      await redis.set(historyKey, JSON.stringify(trimmed));
+      res.json({ type: 'progress-saved' });
+    } catch (error) {
+      console.error('Error saving progress', error);
+      res.status(500).json({
+        status: 'error',
+        message: error instanceof Error ? error.message : 'Failed to save progress',
       });
     }
   }

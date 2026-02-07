@@ -2,12 +2,16 @@ import { useState, useEffect, useRef } from 'react';
 import { useCryptogram } from '../hooks/useCryptogram';
 import { formatTime } from '../../shared/types/puzzle';
 import { generateCipherMap } from '../../shared/cryptogram/engine';
+import type { PlayHistoryEntry } from '../../shared/types/api';
 
 type GameMode = 'daily' | 'practice';
 
 export const App = () => {
   const [mode, setMode] = useState<GameMode>('daily');
   const [showKey, setShowKey] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [playHistory, setPlayHistory] = useState<PlayHistoryEntry[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [selectedSubreddit, setSelectedSubreddit] = useState<string>('');
   const [availableSubreddits, setAvailableSubreddits] = useState<string[]>([]);
   
@@ -15,7 +19,6 @@ export const App = () => {
     gameState,
     loading,
     error,
-    score,
     currentScore,
     handleTileClick,
     handleLetterClick,
@@ -25,7 +28,9 @@ export const App = () => {
     clearAll,
     generateShare,
     loadNextPuzzle,
-  } = useCryptogram({ mode, subreddit: selectedSubreddit || undefined });
+    saveProgress,
+    loadFromHistoryEntry,
+  } = useCryptogram({ mode, ...(selectedSubreddit ? { subreddit: selectedSubreddit } : {}) });
 
   // Load available subreddits for practice mode
   useEffect(() => {
@@ -207,33 +212,47 @@ export const App = () => {
   // Cipher key for debug
   const cipherMap = puzzle ? generateCipherMap(puzzle.seed) : null;
 
-  // Generate Reddit link - permalink should be a relative path from Reddit API
-  const getRedditLink = (source: typeof puzzle.source) => {
-    if (!source.permalink) {
-      // Fallback: create search URL if no permalink
-      const subreddit = source.subreddit.replace('r/', '').replace('r', '');
-      const searchQuery = encodeURIComponent(source.title);
-      return `https://reddit.com/r/${subreddit}/search/?q=${searchQuery}&restrict_sr=1&sort=relevance&t=all`;
+  // Build full Reddit URL for "View Original Post" (works in webviews by opening explicitly)
+  const getRedditLink = (source: typeof puzzle.source): string => {
+    if (!source?.subreddit && !source?.permalink) return '';
+    const sub = (source.subreddit || '').replace(/^r\//, '').replace(/^r/, '') || 'reddit';
+    if (source.permalink) {
+      if (source.permalink.startsWith('http')) return source.permalink;
+      const path = source.permalink.startsWith('/') ? source.permalink : `/${source.permalink}`;
+      return `https://www.reddit.com${path}`;
     }
-    
-    // If it's already a full URL, use it
-    if (source.permalink.startsWith('http')) {
-      return source.permalink;
-    }
-    
-    // Reddit permalinks are relative paths like /r/subreddit/comments/postid/title/
-    // Prepend reddit.com to make it a full URL
-    if (source.permalink.startsWith('/')) {
-      return `https://reddit.com${source.permalink}`;
-    }
-    
-    // If it doesn't start with /, it might be malformed, try to construct it
-    // Format: /r/subreddit/comments/postid/title/
-    const subreddit = source.subreddit.replace('r/', '').replace('r', '');
-    return `https://reddit.com/r/${subreddit}/comments/${source.id}`;
+    return `https://www.reddit.com/r/${sub}/comments/${source.id}`;
   };
 
   const redditLink = puzzle ? getRedditLink(puzzle.source) : null;
+
+  // Merge current solved puzzle into history for display (fixes blank history when submit didn't persist)
+  const displayHistory = (() => {
+    const list = [...playHistory];
+    if (gameState.isSolved && gameState.puzzle && currentScore != null) {
+      if (!list.some((e) => e.puzzleId === gameState.puzzle!.id)) {
+        const src = gameState.puzzle.source;
+        const postLink = src.permalink
+          ? src.permalink.startsWith('http')
+            ? src.permalink
+            : `https://www.reddit.com${src.permalink.startsWith('/') ? '' : '/'}${src.permalink}`
+          : `https://www.reddit.com/r/${(src.subreddit || '').replace(/^r\//, '')}/comments/${src.id}`;
+        list.unshift({
+          puzzleId: gameState.puzzle.id,
+          date: gameState.puzzle.date,
+          score: currentScore,
+          time: gameState.elapsedTime,
+          hintsUsed: gameState.hintsUsed,
+          mistakes: gameState.mistakes,
+          mode: gameState.puzzle.mode,
+          postLink,
+          subreddit: src.subreddit ?? '',
+          title: src.title ?? '',
+        });
+      }
+    }
+    return list;
+  })();
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-zinc-950 via-zinc-900 to-zinc-950 text-white p-2 sm:p-4 overflow-x-hidden">
@@ -255,21 +274,44 @@ export const App = () => {
               {formatTime(elapsedTime)}
             </div>
           </div>
-          {mode === 'practice' && (
+          <div className="flex items-center gap-1 flex-shrink-0">
             <button
-              onClick={() => setShowKey(!showKey)}
-              className="px-2 sm:px-3 py-1 bg-zinc-800 rounded text-xs text-zinc-400 hover:bg-zinc-700 flex-shrink-0"
+              type="button"
+              onClick={async () => {
+                setShowHistory(true);
+                setHistoryLoading(true);
+                try {
+                  const res = await fetch('/api/score/history');
+                  const data = await res.json();
+                  setPlayHistory(data.history ?? []);
+                } catch (e) {
+                  setPlayHistory([]);
+                } finally {
+                  setHistoryLoading(false);
+                }
+              }}
+              className="px-2 sm:px-3 py-1 bg-zinc-800 rounded text-xs text-zinc-400 hover:bg-zinc-700"
             >
-              {showKey ? 'Hide' : 'Show'} Key
+              📊 History
             </button>
-          )}
+            {mode === 'practice' && (
+              <button
+                type="button"
+                onClick={() => setShowKey(!showKey)}
+                className="px-2 sm:px-3 py-1 bg-zinc-800 rounded text-xs text-zinc-400 hover:bg-zinc-700"
+              >
+                {showKey ? 'Hide' : 'Show'} Key
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Mode selector */}
         <div className="flex flex-col gap-2 mb-4">
           <div className="flex gap-2 flex-wrap">
             <button
-              onClick={() => {
+              onClick={async () => {
+                await saveProgress?.();
                 setMode('daily');
                 setSelectedSubreddit('');
               }}
@@ -282,7 +324,10 @@ export const App = () => {
               Daily
             </button>
             <button
-              onClick={() => setMode('practice')}
+              onClick={async () => {
+                await saveProgress?.();
+                setMode('practice');
+              }}
               className={`px-3 sm:px-4 py-2 rounded-lg font-semibold text-sm sm:text-base ${
                 mode === 'practice'
                   ? 'bg-orange-500 text-white'
@@ -291,6 +336,23 @@ export const App = () => {
             >
               Practice
             </button>
+            {!isSolved && gameState.puzzle && (
+              <button
+                type="button"
+                onClick={async () => {
+                  await saveProgress?.();
+                  setShowHistory(true);
+                  setHistoryLoading(false);
+                  const res = await fetch('/api/score/history');
+                  const data = await res.json().catch(() => ({ history: [] }));
+                  setPlayHistory(data.history ?? []);
+                }}
+                className="px-3 sm:px-4 py-2 rounded-lg font-semibold bg-amber-600 hover:bg-amber-500 text-white text-sm sm:text-base"
+                title="Save progress and find this puzzle in History to resume later"
+              >
+                ⏸ Pause & save
+              </button>
+            )}
             {mode === 'practice' && !isSolved && (
               <button
                 onClick={loadNextPuzzle}
@@ -349,12 +411,105 @@ export const App = () => {
           </div>
         )}
 
-        {/* Victory Modal Overlay */}
-        {isSolved && (
+        {/* Play History Modal */}
+        {showHistory && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+            <div className="bg-zinc-900 rounded-xl border border-zinc-700 max-w-lg w-full max-h-[85vh] overflow-hidden flex flex-col">
+              <div className="p-4 border-b border-zinc-700 flex justify-between items-center">
+                <h2 className="text-lg font-bold text-white">Play History</h2>
+                <button
+                  type="button"
+                  onClick={() => setShowHistory(false)}
+                  className="text-zinc-400 hover:text-white"
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="p-4 overflow-y-auto flex-1">
+                {historyLoading ? (
+                  <p className="text-zinc-400 text-sm">Loading...</p>
+                ) : displayHistory.length === 0 ? (
+                  <p className="text-zinc-400 text-sm">No puzzles yet. Solve one or pause and save to see it here!</p>
+                ) : (
+                  <>
+                    <p className="text-zinc-400 text-xs mb-3">
+                      {displayHistory.length} puzzle{displayHistory.length !== 1 ? 's' : ''} in history
+                      {displayHistory.filter((e) => e.score > 0).length > 0 && (
+                        <> · Avg score: {Math.round(displayHistory.filter((e) => e.score > 0).reduce((a, e) => a + e.score, 0) / displayHistory.filter((e) => e.score > 0).length).toLocaleString()}</>
+                      )}
+                    </p>
+                    <ul className="space-y-2">
+                      {displayHistory.map((entry, i) => (
+                        <li
+                          key={`${entry.puzzleId}-${i}`}
+                          className="bg-zinc-800/80 rounded-lg p-3 text-left border border-zinc-700"
+                        >
+                          <div className="flex justify-between items-start gap-2">
+                            <div className="min-w-0 flex-1">
+                              <span className="text-orange-400 font-semibold text-xs uppercase">{entry.mode}</span>
+                              <span className="text-zinc-500 text-xs ml-2">{entry.date}</span>
+                              {entry.isInProgress && (
+                                <span className="ml-2 text-amber-400 text-xs">In progress</span>
+                              )}
+                              <p className="text-white text-sm truncate mt-0.5" title={entry.title}>
+                                {entry.title || '—'}
+                              </p>
+                              <p className="text-zinc-400 text-xs mt-1">
+                                {entry.isInProgress ? (
+                                  <>Paused at {formatTime(entry.elapsedTime ?? entry.time)} · {entry.subreddit}</>
+                                ) : (
+                                  <>{entry.score.toLocaleString()} pts · {formatTime(entry.time)} · {entry.subreddit}</>
+                                )}
+                              </p>
+                            </div>
+                            <div className="flex flex-shrink-0 gap-1">
+                              {entry.isInProgress && entry.savedPuzzle ? (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    loadFromHistoryEntry(entry);
+                                    setMode(entry.savedPuzzle!.mode);
+                                    if (entry.savedPuzzle!.mode === 'practice' && entry.subreddit) {
+                                      setSelectedSubreddit(entry.subreddit);
+                                    } else {
+                                      setSelectedSubreddit('');
+                                    }
+                                    setShowHistory(false);
+                                  }}
+                                  className="px-2 py-1 bg-emerald-600 hover:bg-emerald-500 rounded text-xs font-medium"
+                                >
+                                  Resume
+                                </button>
+                              ) : null}
+                              {entry.postLink ? (
+                                <a
+                                  href={entry.postLink}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className={`inline-block px-2 py-1 rounded text-xs font-medium text-white no-underline ${entry.isInProgress ? 'bg-zinc-600 hover:bg-zinc-500' : 'bg-orange-500 hover:bg-orange-400'}`}
+                                >
+                                  View post
+                                </a>
+                              ) : null}
+                            </div>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Victory Modal Overlay - daily and practice */}
+        {isSolved && puzzle && (
           <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
             <div className="bg-gradient-to-r from-emerald-900/30 to-blue-900/30 rounded-xl p-4 sm:p-6 md:p-8 border border-emerald-500/50 text-center max-w-md w-full mx-4 max-h-[90vh] overflow-y-auto">
               <div className="text-4xl sm:text-5xl mb-2">🎉</div>
               <h2 className="text-xl sm:text-2xl font-black text-emerald-400 mb-2">SOLVED!</h2>
+              <p className="text-sm text-zinc-400 mb-1">{mode === 'practice' ? 'Congratulations! You solved the puzzle.' : 'Congratulations! You solved today\'s puzzle.'}</p>
               <p className="text-sm sm:text-base text-zinc-300 italic mb-4 break-words">"{puzzle.plainText}"</p>
               
               {/* Stats Grid */}
@@ -381,10 +536,21 @@ export const App = () => {
                 )}
               </div>
               
-              {/* Action Buttons */}
+              {/* Action Buttons: View Original Post, Share (daily), Continue in Practice / Next Puzzle */}
               <div className="flex flex-col gap-2 mt-4">
+                {redditLink && (
+                  <a
+                    href={redditLink}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-block text-center px-4 sm:px-6 py-2 bg-orange-500 hover:bg-orange-400 rounded-lg font-bold text-sm sm:text-base text-white no-underline"
+                  >
+                    🔗 View Original Post
+                  </a>
+                )}
                 {mode === 'daily' && (
                   <button
+                    type="button"
                     onClick={async () => {
                       const shareText = await generateShare();
                       if (shareText) {
@@ -394,26 +560,29 @@ export const App = () => {
                     }}
                     className="px-4 sm:px-6 py-2 bg-blue-500 hover:bg-blue-400 rounded-lg font-bold text-sm sm:text-base"
                   >
-                    📋 Copy Share Text
+                    📋 Share Results
+                  </button>
+                )}
+                {mode === 'daily' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMode('practice');
+                      setSelectedSubreddit('');
+                    }}
+                    className="px-4 sm:px-6 py-2 bg-green-500 hover:bg-green-400 rounded-lg font-bold text-sm sm:text-base"
+                  >
+                    🎮 Continue in Practice Mode
                   </button>
                 )}
                 {mode === 'practice' && (
                   <button
+                    type="button"
                     onClick={loadNextPuzzle}
                     className="px-4 sm:px-6 py-2 bg-green-500 hover:bg-green-400 rounded-lg font-bold text-sm sm:text-base"
                   >
                     ➡️ Next Puzzle
                   </button>
-                )}
-                {redditLink && (
-                  <a
-                    href={redditLink}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="px-4 sm:px-6 py-2 bg-orange-500 hover:bg-orange-400 rounded-lg font-bold text-center block text-sm sm:text-base"
-                  >
-                    View Original Post →
-                  </a>
                 )}
               </div>
             </div>

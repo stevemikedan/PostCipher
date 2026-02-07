@@ -1,5 +1,7 @@
 // Puzzle-related type definitions
 
+export type PuzzleDifficulty = 'easy' | 'medium' | 'hard';
+
 export interface RedditPost {
   id: string;
   title: string;
@@ -8,6 +10,10 @@ export interface RedditPost {
   upvotes: number;
   permalink: string;
   createdUtc: number;
+  /** True if title has no digits and is mostly letters/spaces (good for substitution cipher) */
+  cipherFriendly?: boolean;
+  /** Derived from title length/word count for filtering or display */
+  difficulty?: PuzzleDifficulty;
 }
 
 export interface Puzzle {
