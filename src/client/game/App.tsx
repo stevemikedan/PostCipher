@@ -1,19 +1,53 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, type ReactNode } from 'react';
 import { useCryptogram } from '../hooks/useCryptogram';
 import { formatTime } from '../../shared/types/puzzle';
 import { generateCipherMap } from '../../shared/cryptogram/engine';
 import type { PlayHistoryEntry } from '../../shared/types/api';
+import { TERMS_CONTENT } from '../legal/terms-content';
+import { PRIVACY_CONTENT } from '../legal/privacy-content';
 
 type GameMode = 'daily' | 'practice';
+
+function renderLegalContent(content: string): ReactNode {
+  const lines = content.split('\n');
+  const out: ReactNode[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line == null) { i++; continue; }
+    if (line.startsWith('# ')) {
+      out.push(<h1 key={i} className="text-lg font-bold text-white mt-4 mb-2 first:mt-0">{line.slice(2)}</h1>);
+      i++;
+    } else if (line.startsWith('## ')) {
+      out.push(<h2 key={i} className="text-sm font-bold text-zinc-300 mt-3 mb-1">{line.slice(3)}</h2>);
+      i++;
+    } else if (line.startsWith('- ')) {
+      out.push(<li key={i} className="text-zinc-400 text-sm ml-4">{line.slice(2)}</li>);
+      i++;
+    } else if (line.trim() === '') {
+      i++;
+    } else {
+      out.push(<p key={i} className="text-zinc-400 text-sm mb-2">{line}</p>);
+      i++;
+    }
+  }
+  return <div className="space-y-0">{out}</div>;
+}
 
 export const App = () => {
   const [mode, setMode] = useState<GameMode>('daily');
   const [showKey, setShowKey] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showTerms, setShowTerms] = useState(false);
+  const [showPrivacy, setShowPrivacy] = useState(false);
   const [playHistory, setPlayHistory] = useState<PlayHistoryEntry[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [selectedSubreddit, setSelectedSubreddit] = useState<string>('');
+  const [customSubreddit, setCustomSubreddit] = useState<string>('');
+  const [appliedCustomSubreddit, setAppliedCustomSubreddit] = useState<string>('');
   const [availableSubreddits, setAvailableSubreddits] = useState<string[]>([]);
+
+  const practiceFilter = selectedSubreddit || appliedCustomSubreddit;
   
   const {
     gameState,
@@ -30,7 +64,7 @@ export const App = () => {
     loadNextPuzzle,
     saveProgress,
     loadFromHistoryEntry,
-  } = useCryptogram({ mode, ...(selectedSubreddit ? { subreddit: selectedSubreddit } : {}) });
+  } = useCryptogram({ mode, ...(practiceFilter ? { subreddit: practiceFilter } : {}) });
 
   // Load available subreddits for practice mode
   useEffect(() => {
@@ -212,21 +246,22 @@ export const App = () => {
   // Cipher key for debug
   const cipherMap = puzzle ? generateCipherMap(puzzle.seed) : null;
 
-  // Build full Reddit URL for "View Original Post" (works in webviews by opening explicitly)
-  const getRedditLink = (source: typeof puzzle.source): string => {
-    if (!source?.subreddit && !source?.permalink) return '';
-    const sub = (source.subreddit || '').replace(/^r\//, '').replace(/^r/, '') || 'reddit';
-    if (source.permalink) {
-      if (source.permalink.startsWith('http')) return source.permalink;
-      const path = source.permalink.startsWith('/') ? source.permalink : `/${source.permalink}`;
-      return `https://www.reddit.com${path}`;
+  /** Build full Reddit post URL so links work (hover shows URL, open in new tab). Server always sends permalink or id+subreddit. */
+  const getRedditLink = (source: { permalink?: string; subreddit?: string; id?: string } | null | undefined): string => {
+    if (!source) return '';
+    const sub = (source.subreddit || '').replace(/^r\//, '').replace(/^r/, '').trim() || 'reddit';
+    const raw = (source.permalink || '').trim();
+    if (raw) {
+      if (raw.startsWith('http')) return raw;
+      return `https://www.reddit.com${raw.startsWith('/') ? raw : `/${raw}`}`;
     }
-    return `https://www.reddit.com/r/${sub}/comments/${source.id}`;
+    if (source.id) return `https://www.reddit.com/r/${sub}/comments/${source.id}`;
+    return `https://www.reddit.com/r/${sub}`;
   };
 
   const redditLink = puzzle ? getRedditLink(puzzle.source) : null;
 
-  // Merge current solved puzzle into history for display (fixes blank history when submit didn't persist)
+  // Merge current solved puzzle into history for display; dedupe by puzzleId so daily shows once
   const displayHistory = (() => {
     const list = [...playHistory];
     if (gameState.isSolved && gameState.puzzle && currentScore != null) {
@@ -251,7 +286,13 @@ export const App = () => {
         });
       }
     }
-    return list;
+    const seen = new Set<string>();
+    return list.filter((e) => {
+      if (e.puzzleId.startsWith('daily-') && e.mode === 'practice') return false;
+      if (seen.has(e.puzzleId)) return false;
+      seen.add(e.puzzleId);
+      return true;
+    });
   })();
 
   return (
@@ -314,6 +355,8 @@ export const App = () => {
                 await saveProgress?.();
                 setMode('daily');
                 setSelectedSubreddit('');
+                setCustomSubreddit('');
+                setAppliedCustomSubreddit('');
               }}
               className={`px-3 sm:px-4 py-2 rounded-lg font-semibold text-sm sm:text-base ${
                 mode === 'daily'
@@ -327,6 +370,8 @@ export const App = () => {
               onClick={async () => {
                 await saveProgress?.();
                 setMode('practice');
+                setCustomSubreddit('');
+                setAppliedCustomSubreddit('');
               }}
               className={`px-3 sm:px-4 py-2 rounded-lg font-semibold text-sm sm:text-base ${
                 mode === 'practice'
@@ -363,22 +408,63 @@ export const App = () => {
             )}
           </div>
           
-          {/* Subreddit selector for practice mode */}
-          {mode === 'practice' && availableSubreddits.length > 0 && (
-            <div className="flex items-center gap-2">
-              <label className="text-sm text-zinc-400">Filter by subreddit:</label>
+          {/* Filter: Trending or by subreddit (dropdown + custom) for practice */}
+          {mode === 'practice' && (
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="text-sm text-zinc-400">Filter:</label>
               <select
                 value={selectedSubreddit}
-                onChange={(e) => setSelectedSubreddit(e.target.value)}
+                onChange={(e) => {
+                  setSelectedSubreddit(e.target.value);
+                  setCustomSubreddit('');
+                  setAppliedCustomSubreddit('');
+                }}
                 className="px-3 py-1 bg-zinc-800 text-white rounded-lg border border-zinc-700 focus:border-orange-500 focus:outline-none"
+                title="Popular = hot posts from multiple subreddits, sorted by upvotes"
               >
-                <option value="">All Subreddits</option>
+                <option value="">Popular</option>
                 {availableSubreddits.map((sub) => (
                   <option key={sub} value={sub}>
                     {sub}
                   </option>
                 ))}
               </select>
+              <span className="text-zinc-500 text-sm">or custom:</span>
+              <span className="text-zinc-400 text-sm">r/</span>
+              <input
+                type="text"
+                value={customSubreddit}
+                onChange={(e) => setCustomSubreddit(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    const name = customSubreddit.trim().replace(/^r\/?/, '');
+                    if (name) {
+                      setAppliedCustomSubreddit(`r/${name}`);
+                      setSelectedSubreddit('');
+                    }
+                  }
+                }}
+                placeholder="subreddit (Enter to apply)"
+                className="w-28 sm:w-32 px-2 py-1 bg-zinc-800 text-white rounded-lg border border-zinc-700 focus:border-orange-500 focus:outline-none text-sm placeholder-zinc-500"
+                aria-label="Custom subreddit name — press Enter to apply"
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  const name = customSubreddit.trim().replace(/^r\/?/, '');
+                  if (name) {
+                    setAppliedCustomSubreddit(`r/${name}`);
+                    setSelectedSubreddit('');
+                  }
+                }}
+                className="px-2 py-1 bg-orange-500 hover:bg-orange-400 rounded-lg text-xs font-medium text-white"
+              >
+                Go
+              </button>
+              <p className="text-zinc-500 text-xs w-full mt-0.5">
+                Popular = hot posts from several subreddits, sorted by upvotes. Type any subreddit and press Enter or Go.
+              </p>
             </div>
           )}
         </div>
@@ -451,8 +537,8 @@ export const App = () => {
                               {entry.isInProgress && (
                                 <span className="ml-2 text-amber-400 text-xs">In progress</span>
                               )}
-                              <p className="text-white text-sm truncate mt-0.5" title={entry.title}>
-                                {entry.title || '—'}
+                              <p className="text-white text-sm truncate mt-0.5" title={entry.isInProgress ? undefined : (entry.title || '')}>
+                                {entry.isInProgress ? 'Paused puzzle — resume to continue' : (entry.title || '—')}
                               </p>
                               <p className="text-zinc-400 text-xs mt-1">
                                 {entry.isInProgress ? (
@@ -471,8 +557,12 @@ export const App = () => {
                                     setMode(entry.savedPuzzle!.mode);
                                     if (entry.savedPuzzle!.mode === 'practice' && entry.subreddit) {
                                       setSelectedSubreddit(entry.subreddit);
+                                      setCustomSubreddit('');
+                                      setAppliedCustomSubreddit('');
                                     } else {
                                       setSelectedSubreddit('');
+                                      setCustomSubreddit('');
+                                      setAppliedCustomSubreddit('');
                                     }
                                     setShowHistory(false);
                                   }}
@@ -481,16 +571,19 @@ export const App = () => {
                                   Resume
                                 </button>
                               ) : null}
-                              {entry.postLink ? (
-                                <a
-                                  href={entry.postLink}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className={`inline-block px-2 py-1 rounded text-xs font-medium text-white no-underline ${entry.isInProgress ? 'bg-zinc-600 hover:bg-zinc-500' : 'bg-orange-500 hover:bg-orange-400'}`}
-                                >
-                                  View post
-                                </a>
-                              ) : null}
+                              {(() => {
+                                const entryUrl = entry.postLink || (entry.savedPuzzle ? getRedditLink(entry.savedPuzzle.source) : '') || (entry.subreddit ? `https://www.reddit.com/r/${(entry.subreddit || '').replace(/^r\//, '').trim()}` : '');
+                                return entryUrl ? (
+                                  <a
+                                    href={entryUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className={`inline-block px-2 py-1 rounded text-xs font-medium text-white no-underline ${entry.isInProgress ? 'bg-zinc-600 hover:bg-zinc-500' : 'bg-orange-500 hover:bg-orange-400'}`}
+                                  >
+                                    View post
+                                  </a>
+                                ) : null;
+                              })()}
                             </div>
                           </div>
                         </li>
@@ -536,32 +629,50 @@ export const App = () => {
                 )}
               </div>
               
-              {/* Action Buttons: View Original Post, Share (daily), Continue in Practice / Next Puzzle */}
+              {/* Action Buttons: View Original Post (real link), Share (daily), Continue / Next */}
               <div className="flex flex-col gap-2 mt-4">
                 {redditLink && (
                   <a
                     href={redditLink}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="inline-block text-center px-4 sm:px-6 py-2 bg-orange-500 hover:bg-orange-400 rounded-lg font-bold text-sm sm:text-base text-white no-underline"
+                    className="inline-block text-center w-full px-4 sm:px-6 py-2 bg-orange-500 hover:bg-orange-400 rounded-lg font-bold text-sm sm:text-base text-white no-underline"
                   >
                     🔗 View Original Post
                   </a>
                 )}
                 {mode === 'daily' && (
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      const shareText = await generateShare();
-                      if (shareText) {
-                        await navigator.clipboard.writeText(shareText);
-                        alert('Share text copied to clipboard!');
-                      }
-                    }}
-                    className="px-4 sm:px-6 py-2 bg-blue-500 hover:bg-blue-400 rounded-lg font-bold text-sm sm:text-base"
-                  >
-                    📋 Share Results
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const shareText = await generateShare();
+                        if (shareText) {
+                          const shareUrl = `https://www.reddit.com/submit?title=${encodeURIComponent(shareText)}`;
+                          window.open(shareUrl, '_blank', 'noopener,noreferrer');
+                        }
+                      }}
+                      className="px-4 sm:px-6 py-2 bg-blue-500 hover:bg-blue-400 rounded-lg font-bold text-sm sm:text-base"
+                    >
+                      📋 Share on Reddit (new tab)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const playLink = typeof window !== 'undefined' ? window.location.href : '';
+                        const text = `I scored ${currentScore.toLocaleString()} in ${formatTime(elapsedTime)} with ${hintsUsed} hint${hintsUsed !== 1 ? 's' : ''} on PostCipher! Play the game: ${playLink}`;
+                        try {
+                          await navigator.clipboard.writeText(text);
+                          alert('Copied to clipboard! Paste anywhere to share.');
+                        } catch {
+                          alert(`Copy this to share:\n\n${text}`);
+                        }
+                      }}
+                      className="px-4 sm:px-6 py-2 bg-zinc-600 hover:bg-zinc-500 rounded-lg font-bold text-sm sm:text-base"
+                    >
+                      📤 Copy to share elsewhere
+                    </button>
+                  </>
                 )}
                 {mode === 'daily' && (
                   <button
@@ -569,6 +680,8 @@ export const App = () => {
                     onClick={() => {
                       setMode('practice');
                       setSelectedSubreddit('');
+                      setCustomSubreddit('');
+                      setAppliedCustomSubreddit('');
                     }}
                     className="px-4 sm:px-6 py-2 bg-green-500 hover:bg-green-400 rounded-lg font-bold text-sm sm:text-base"
                   >
@@ -724,7 +837,56 @@ export const App = () => {
             ))}
           </div>
         )}
+
+        {/* Footer: Terms & Privacy */}
+        <footer className="mt-6 pt-4 pb-2 border-t border-zinc-800 text-center text-xs text-zinc-500">
+          <button
+            type="button"
+            onClick={() => setShowTerms(true)}
+            className="hover:text-zinc-300 underline"
+          >
+            Terms of Service
+          </button>
+          {' · '}
+          <button
+            type="button"
+            onClick={() => setShowPrivacy(true)}
+            className="hover:text-zinc-300 underline"
+          >
+            Privacy Policy
+          </button>
+        </footer>
       </div>
+
+      {/* Terms of Service modal */}
+      {showTerms && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="bg-zinc-900 rounded-xl border border-zinc-700 max-w-lg w-full max-h-[85vh] overflow-hidden flex flex-col">
+            <div className="p-4 border-b border-zinc-700 flex justify-between items-center">
+              <h2 className="text-lg font-bold text-white">Terms of Service</h2>
+              <button type="button" onClick={() => setShowTerms(false)} className="text-zinc-400 hover:text-white">✕</button>
+            </div>
+            <div className="p-4 overflow-y-auto flex-1 text-left">
+              {renderLegalContent(TERMS_CONTENT)}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Privacy Policy modal */}
+      {showPrivacy && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="bg-zinc-900 rounded-xl border border-zinc-700 max-w-lg w-full max-h-[85vh] overflow-hidden flex flex-col">
+            <div className="p-4 border-b border-zinc-700 flex justify-between items-center">
+              <h2 className="text-lg font-bold text-white">Privacy Policy</h2>
+              <button type="button" onClick={() => setShowPrivacy(false)} className="text-zinc-400 hover:text-white">✕</button>
+            </div>
+            <div className="p-4 overflow-y-auto flex-1 text-left">
+              {renderLegalContent(PRIVACY_CONTENT)}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

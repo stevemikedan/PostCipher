@@ -96,21 +96,23 @@ export async function getDailyPuzzle(date: Date = new Date()): Promise<Puzzle> {
 
   // Generate new puzzle using hash-based post selection
   const puzzleNumber = await getPuzzleNumber();
-  
-  // Normalize date for seed generation (needed regardless of source)
   const normalizedDate = new Date(dateString + 'T00:00:00Z');
-  
-  // Refresh library from Reddit when possible, then select daily from database (stable, no repeats)
+
+  // Prefer library first for fast response; refresh library in background for next time
   let source: RedditPost;
   try {
-    const redditPosts = await fetchTrendingPosts(100);
-    if (redditPosts.length > 0) {
-      await syncRedditPostsToLibrary(redditPosts);
-    }
     source = await getDailyPost(normalizedDate);
+    refreshLibraryInBackground();
   } catch (error) {
-    console.error('Error in daily puzzle (Reddit sync or getDailyPost), using database only:', error);
-    source = await getDailyPost(normalizedDate);
+    console.error('Daily puzzle: no post in library, syncing from Reddit:', error);
+    try {
+      const redditPosts = await fetchTrendingPosts(100);
+      if (redditPosts.length > 0) await syncRedditPostsToLibrary(redditPosts);
+      source = await getDailyPost(normalizedDate);
+    } catch (err2) {
+      console.error('Error in daily puzzle (Reddit sync or getDailyPost):', err2);
+      source = await getDailyPost(normalizedDate);
+    }
   }
 
   const puzzleId = `daily-${dateString}`;
@@ -141,9 +143,29 @@ export async function getDailyPuzzle(date: Date = new Date()): Promise<Puzzle> {
 }
 
 /**
- * Generate a practice puzzle
- * When a subreddit is set: fetches a batch from Reddit, syncs to library, then picks one by requestSeed.
- * Otherwise tries single fetch then database. requestSeed (e.g. Date.now()) ensures each "New Puzzle" gets a different post.
+ * Fire-and-forget: fetch from Reddit and sync to library so future practice loads stay fresh.
+ * Does not block the response.
+ */
+function refreshLibraryInBackground(subreddit?: string): void {
+  void (async () => {
+    try {
+      if (subreddit) {
+        const batch = await fetchPostsForSubreddit(subreddit, 50);
+        if (batch.length > 0) await syncRedditPostsToLibrary(batch);
+      } else {
+        const posts = await fetchTrendingPosts(50);
+        if (posts.length > 0) await syncRedditPostsToLibrary(posts);
+      }
+    } catch (e) {
+      console.warn('Background library refresh failed:', e);
+    }
+  })();
+}
+
+/**
+ * Generate a practice puzzle.
+ * Uses library first for fast load; refreshes library in the background for next time.
+ * Falls back to Reddit fetch only when the library is empty or has no posts for the subreddit.
  */
 export async function getPracticePuzzle(
   subreddit?: string,
@@ -154,45 +176,52 @@ export async function getPracticePuzzle(
 
   console.log(`Getting practice puzzle${subreddit ? ` for ${subreddit}` : ''}`);
 
-  if (subreddit) {
-    try {
-      const batch = await fetchPostsForSubreddit(subreddit, 50);
-      if (batch.length > 0) {
-        await syncRedditPostsToLibrary(batch);
-        source = selectPostFromPool(batch, seedForSelection);
-        console.log(
-          `Using post from ${source.subreddit} (selected from batch of ${batch.length} by seed)`
-        );
-      } else {
-        throw new Error('No posts returned for subreddit');
-      }
-    } catch (error) {
-      console.error(
-        `Error fetching batch for ${subreddit}, using library:`,
-        error
-      );
+  // Fast path: try library first so we can return immediately
+  try {
+    source = await getRandomPost(subreddit, seedForSelection);
+    console.log(`Using library post from ${source.subreddit}`);
+    refreshLibraryInBackground(subreddit);
+  } catch {
+    // Slow path: library empty or no posts for subreddit — fetch from Reddit, sync, then use result
+    if (subreddit) {
       try {
-        source = await getRandomPost(subreddit, seedForSelection);
-        console.log(`Using database post from ${source.subreddit}`);
-      } catch (dbError) {
-        console.warn(`No posts for ${subreddit} in database, trying any`);
+        const batch = await fetchPostsForSubreddit(subreddit, 50);
+        if (batch.length > 0) {
+          await syncRedditPostsToLibrary(batch);
+          source = selectPostFromPool(batch, seedForSelection);
+          console.log(
+            `Using post from ${source.subreddit} (selected from batch of ${batch.length} by seed)`
+          );
+        } else {
+          throw new Error('No posts returned for subreddit');
+        }
+      } catch (error) {
+        console.error(
+          `Error fetching batch for ${subreddit}, using library:`,
+          error
+        );
+        try {
+          source = await getRandomPost(subreddit, seedForSelection);
+          console.log(`Using database post from ${source.subreddit}`);
+        } catch {
+          source = await getRandomPost(undefined, seedForSelection);
+        }
+      }
+    } else {
+      try {
+        const redditPost = await fetchRedditPost();
+        if (redditPost) {
+          source = redditPost;
+          await syncRedditPostsToLibrary([source]);
+          console.log(`Using Reddit post from ${source.subreddit}`);
+        } else {
+          throw new Error('No Reddit post found');
+        }
+      } catch (error) {
+        console.error('Error fetching from Reddit, using database:', error);
         source = await getRandomPost(undefined, seedForSelection);
+        console.log(`Using database post from ${source.subreddit}`);
       }
-    }
-  } else {
-    try {
-      const redditPost = await fetchRedditPost();
-      if (redditPost) {
-        source = redditPost;
-        await syncRedditPostsToLibrary([source]);
-        console.log(`Using Reddit post from ${source.subreddit}`);
-      } else {
-        throw new Error('No Reddit post found');
-      }
-    } catch (error) {
-      console.error('Error fetching from Reddit, using database:', error);
-      source = await getRandomPost(undefined, seedForSelection);
-      console.log(`Using database post from ${source.subreddit}`);
     }
   }
 

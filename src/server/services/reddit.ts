@@ -27,10 +27,20 @@ type DevvitPostLike = {
   createdAt: Date | number;
 };
 
-/** Convert a Devvit API Post to our RedditPost type */
+/** Build canonical Reddit post path so links always work */
+function buildPermalink(id: string, subredditDisplay: string): string {
+  const sub = (subredditDisplay || '').replace(/^r\//, '').trim() || 'reddit';
+  return `/r/${sub}/comments/${id}`;
+}
+
+/** Convert a Devvit API Post to our RedditPost type; ensure permalink is always set */
 function devvitPostToRedditPost(p: DevvitPostLike): RedditPost {
   const id = p.id.replace(/^t3_/, '');
-  const permalink = p.permalink.startsWith('/') ? p.permalink : `/${p.permalink}`;
+  const subreddit = p.subredditName?.startsWith('r/') ? p.subredditName : `r/${p.subredditName || 'unknown'}`;
+  const rawPermalink = p.permalink && String(p.permalink).trim();
+  const permalink = rawPermalink
+    ? (rawPermalink.startsWith('/') ? rawPermalink : `/${rawPermalink}`)
+    : buildPermalink(id, subreddit);
   const author = p.authorName?.startsWith('u/') ? p.authorName : `u/${p.authorName || 'unknown'}`;
   const createdUtc =
     p.createdAt instanceof Date ? p.createdAt.getTime() / 1000 : Number(p.createdAt) / 1000 || Date.now() / 1000;
@@ -38,7 +48,7 @@ function devvitPostToRedditPost(p: DevvitPostLike): RedditPost {
   return {
     id,
     title,
-    subreddit: p.subredditName?.startsWith('r/') ? p.subredditName : `r/${p.subredditName || 'unknown'}`,
+    subreddit,
     author,
     upvotes: p.score ?? 0,
     permalink,
@@ -181,28 +191,19 @@ function isValidContentRelaxed(text: string): boolean {
 }
 
 /**
- * Check if subreddit is allowed
+ * Check if subreddit is allowed (block only blacklisted; allow any subreddit for custom filter)
  */
 function isAllowedSubreddit(subreddit: string): boolean {
-  const normalized = subreddit.toLowerCase().replace('r/', '');
-  
-  // Check blacklist
-  if (CONTENT_FILTERS.blacklistedSubreddits.has(normalized)) {
-    return false;
-  }
-
-  // If whitelist is populated, check it
-  if (CONTENT_FILTERS.whitelistedSubreddits.size > 0) {
-    return CONTENT_FILTERS.whitelistedSubreddits.has(normalized);
-  }
-
-  // Default: allow if not blacklisted
+  const normalized = subreddit.toLowerCase().replace(/^r\//, '').trim();
+  if (!normalized) return false;
+  if (CONTENT_FILTERS.blacklistedSubreddits.has(normalized)) return false;
   return true;
 }
 
 /**
- * Fetch trending posts from Reddit (multiple subreddits, sorted by popularity)
- * Uses Devvit Reddit API first (no allowlist); falls back to HTTP fetch if needed
+ * Fetch "popular" posts: hot posts from multiple subreddits, merged and sorted by upvotes.
+ * This is not Reddit's single "trending" feed — we pull "hot" from our top subreddits and
+ * sort by score. Same logic for "Trending" or "Popular" in the UI.
  */
 export async function fetchTrendingPosts(limit: number = 50): Promise<RedditPost[]> {
   if (USE_MOCK_REDDIT) {
@@ -213,7 +214,6 @@ export async function fetchTrendingPosts(limit: number = 50): Promise<RedditPost
   const subreddits = Array.from(CONTENT_FILTERS.whitelistedSubreddits).slice(0, 10);
   const allPosts: RedditPost[] = [];
 
-  // Try Devvit Reddit API first (no domain allowlist needed)
   for (const subredditName of subreddits) {
     const posts = await fetchPostsFromSubredditViaDevvit(subredditName, {
       sort: 'hot',

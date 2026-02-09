@@ -40,6 +40,8 @@ export const useCryptogram = (options: UseCryptogramOptions) => {
   const practiceSeedRef = useRef(0);
   /** When true, skip the next effect-driven load (e.g. after resuming from history) */
   const skipNextLoadRef = useRef(false);
+  /** Prevent submitting score more than once per puzzle (validate can fire multiple times) */
+  const submittedPuzzleIdsRef = useRef<Set<string>>(new Set());
 
   // Load puzzle
   useEffect(() => {
@@ -131,7 +133,10 @@ export const useCryptogram = (options: UseCryptogramOptions) => {
       if (data.isSolved) {
         setGameState((prev) => ({ ...prev, isSolved: true }));
 
-        // Submit score for both daily and practice (and store for history)
+        if (submittedPuzzleIdsRef.current.has(gameState.puzzle.id)) return;
+        submittedPuzzleIdsRef.current.add(gameState.puzzle.id);
+
+        // Submit score once per puzzle for both daily and practice (and store for history)
         try {
           const src = gameState.puzzle.source;
           const postLink = src.permalink
