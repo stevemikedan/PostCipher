@@ -19,6 +19,7 @@ import { redis, reddit, createServer, context, getServerPort } from '@devvit/web
 import { createPost } from './core/post';
 import { getDailyPuzzle, getPracticePuzzle, validatePuzzle } from './services/puzzle';
 import { calculateScore, generateShareText, formatTime } from '../shared/types/puzzle';
+import { getRedditPostUrl } from '../shared/reddit-link';
 import { initializePostDatabase, getAvailableSubreddits } from './services/post-database';
 
 const app = express();
@@ -628,11 +629,7 @@ router.post<unknown, GenerateShareResponse | ErrorResponse, GenerateShareRequest
       const date = puzzle.date || dateString;
 
       const shareText = generateShareText(puzzleNumber, date, time, hintsUsed, score);
-      const postLink = puzzle.source.permalink
-        ? puzzle.source.permalink.startsWith('http')
-          ? puzzle.source.permalink
-          : `https://reddit.com${puzzle.source.permalink.startsWith('/') ? '' : '/'}${puzzle.source.permalink}`
-        : '';
+      const postLink = getRedditPostUrl(puzzle.source);
 
       res.json({
         type: 'share-generated',

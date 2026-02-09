@@ -3,6 +3,7 @@ import { useCryptogram } from '../hooks/useCryptogram';
 import { formatTime } from '../../shared/types/puzzle';
 import { generateCipherMap } from '../../shared/cryptogram/engine';
 import type { PlayHistoryEntry } from '../../shared/types/api';
+import { getRedditPostUrl } from '../../shared/reddit-link';
 import { TERMS_CONTENT } from '../legal/terms-content';
 import { PRIVACY_CONTENT } from '../legal/privacy-content';
 
@@ -246,20 +247,7 @@ export const App = () => {
   // Cipher key for debug
   const cipherMap = puzzle ? generateCipherMap(puzzle.seed) : null;
 
-  /** Build full Reddit post URL so links work (hover shows URL, open in new tab). Server always sends permalink or id+subreddit. */
-  const getRedditLink = (source: { permalink?: string; subreddit?: string; id?: string } | null | undefined): string => {
-    if (!source) return '';
-    const sub = (source.subreddit || '').replace(/^r\//, '').replace(/^r/, '').trim() || 'reddit';
-    const raw = (source.permalink || '').trim();
-    if (raw) {
-      if (raw.startsWith('http')) return raw;
-      return `https://www.reddit.com${raw.startsWith('/') ? raw : `/${raw}`}`;
-    }
-    if (source.id) return `https://www.reddit.com/r/${sub}/comments/${source.id}`;
-    return `https://www.reddit.com/r/${sub}`;
-  };
-
-  const redditLink = puzzle ? getRedditLink(puzzle.source) : null;
+  const redditLink = puzzle ? getRedditPostUrl(puzzle.source) : null;
 
   // Merge current solved puzzle into history for display; dedupe by puzzleId so daily shows once
   const displayHistory = (() => {
@@ -267,11 +255,7 @@ export const App = () => {
     if (gameState.isSolved && gameState.puzzle && currentScore != null) {
       if (!list.some((e) => e.puzzleId === gameState.puzzle!.id)) {
         const src = gameState.puzzle.source;
-        const postLink = src.permalink
-          ? src.permalink.startsWith('http')
-            ? src.permalink
-            : `https://www.reddit.com${src.permalink.startsWith('/') ? '' : '/'}${src.permalink}`
-          : `https://www.reddit.com/r/${(src.subreddit || '').replace(/^r\//, '')}/comments/${src.id}`;
+        const postLink = getRedditPostUrl(src);
         list.unshift({
           puzzleId: gameState.puzzle.id,
           date: gameState.puzzle.date,
@@ -572,7 +556,7 @@ export const App = () => {
                                 </button>
                               ) : null}
                               {(() => {
-                                const entryUrl = entry.postLink || (entry.savedPuzzle ? getRedditLink(entry.savedPuzzle.source) : '') || (entry.subreddit ? `https://www.reddit.com/r/${(entry.subreddit || '').replace(/^r\//, '').trim()}` : '');
+                                const entryUrl = entry.postLink || (entry.savedPuzzle ? getRedditPostUrl(entry.savedPuzzle.source) : '') || (entry.subreddit ? `https://www.reddit.com/r/${(entry.subreddit || '').replace(/^r\//, '').trim()}` : '');
                                 return entryUrl ? (
                                   <a
                                     href={entryUrl}

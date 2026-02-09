@@ -15,6 +15,7 @@ import type {
 } from '../../shared/types/api';
 import { generateCipherMap } from '../../shared/cryptogram/engine';
 import { calculateScore } from '../../shared/types/puzzle';
+import { getRedditPostUrl } from '../../shared/reddit-link';
 
 interface UseCryptogramOptions {
   mode: 'daily' | 'practice';
@@ -139,11 +140,7 @@ export const useCryptogram = (options: UseCryptogramOptions) => {
         // Submit score once per puzzle for both daily and practice (and store for history)
         try {
           const src = gameState.puzzle.source;
-          const postLink = src.permalink
-            ? src.permalink.startsWith('http')
-              ? src.permalink
-              : `https://www.reddit.com${src.permalink.startsWith('/') ? '' : '/'}${src.permalink}`
-            : `https://www.reddit.com/r/${(src.subreddit || '').replace(/^r\//, '')}/comments/${src.id}`;
+          const postLink = getRedditPostUrl(src);
           const scoreRes = await fetch('/api/score/submit', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -329,11 +326,7 @@ export const useCryptogram = (options: UseCryptogramOptions) => {
   const saveProgress = useCallback(async () => {
     if (!gameState.puzzle || gameState.isSolved) return;
     const src = gameState.puzzle.source;
-    const postLink = src.permalink
-      ? src.permalink.startsWith('http')
-        ? src.permalink
-        : `https://www.reddit.com${src.permalink.startsWith('/') ? '' : '/'}${src.permalink}`
-      : `https://www.reddit.com/r/${(src.subreddit || '').replace(/^r\//, '')}/comments/${src.id}`;
+    const postLink = getRedditPostUrl(src);
     try {
       await fetch('/api/progress/save', {
         method: 'POST',
