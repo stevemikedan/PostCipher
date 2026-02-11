@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, type ReactNode } from 'react';
 import { useCryptogram } from '../hooks/useCryptogram';
 import { formatTime } from '../../shared/types/puzzle';
 import { generateCipherMap } from '../../shared/cryptogram/engine';
-import type { PlayHistoryEntry } from '../../shared/types/api';
+import type { PlayHistoryEntry, LeaderboardEntry } from '../../shared/types/api';
 import { getRedditPostUrl } from '../../shared/reddit-link';
 import { TERMS_CONTENT } from '../legal/terms-content';
 import { PRIVACY_CONTENT } from '../legal/privacy-content';
@@ -47,6 +47,12 @@ export const App = () => {
   const [customSubreddit, setCustomSubreddit] = useState<string>('');
   const [appliedCustomSubreddit, setAppliedCustomSubreddit] = useState<string>('');
   const [availableSubreddits, setAvailableSubreddits] = useState<string[]>([]);
+  const [copyFeedback, setCopyFeedback] = useState(false);
+  const [gamePostUrl, setGamePostUrl] = useState<string>('');
+  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [userRank, setUserRank] = useState<number | undefined>();
+  const [totalPlayers, setTotalPlayers] = useState<number>(0);
+  const [leaderboardLoading, setLeaderboardLoading] = useState(false);
 
   const practiceFilter = selectedSubreddit || appliedCustomSubreddit;
   
@@ -61,7 +67,6 @@ export const App = () => {
     removeLetterMapping,
     useHint,
     clearAll,
-    generateShare,
     loadNextPuzzle,
     saveProgress,
     loadFromHistoryEntry,
@@ -80,6 +85,36 @@ export const App = () => {
         .catch((err) => console.error('Failed to load subreddits', err));
     }
   }, [mode]);
+
+  // Load game post URL for sharing (short Reddit link to this game post)
+  useEffect(() => {
+    fetch('/api/post-url')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.postUrl) {
+          setGamePostUrl(data.postUrl);
+        }
+      })
+      .catch((err) => console.error('Failed to load post URL', err));
+  }, []);
+
+  // Fetch leaderboard when daily puzzle is solved
+  useEffect(() => {
+    if (mode === 'daily' && gameState.isSolved && gameState.puzzle?.id) {
+      setLeaderboardLoading(true);
+      fetch(`/api/leaderboard/daily?puzzleId=${encodeURIComponent(gameState.puzzle.id)}`)
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.type === 'leaderboard') {
+            setLeaderboard(data.entries || []);
+            setUserRank(data.userRank);
+            setTotalPlayers(data.totalPlayers || 0);
+          }
+        })
+        .catch((err) => console.error('Failed to load leaderboard', err))
+        .finally(() => setLeaderboardLoading(false));
+    }
+  }, [mode, gameState.isSolved, gameState.puzzle?.id]);
 
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -562,9 +597,9 @@ export const App = () => {
                                     href={entryUrl}
                                     target="_blank"
                                     rel="noopener noreferrer"
-                                    className={`inline-block px-2 py-1 rounded text-xs font-medium text-white no-underline ${entry.isInProgress ? 'bg-zinc-600 hover:bg-zinc-500' : 'bg-orange-500 hover:bg-orange-400'}`}
+                                    className={`px-2 py-1 rounded text-xs font-medium text-white inline-block ${entry.isInProgress ? 'bg-zinc-600 hover:bg-zinc-500' : 'bg-orange-500 hover:bg-orange-400'}`}
                                   >
-                                    View post
+                                    View Post
                                   </a>
                                 ) : null;
                               })()}
@@ -612,51 +647,104 @@ export const App = () => {
                   </div>
                 )}
               </div>
+
+              {/* Daily Leaderboard */}
+              {mode === 'daily' && (
+                <div className="mt-4 mb-2">
+                  <h3 className="text-sm font-bold text-zinc-400 mb-2 flex items-center justify-center gap-2">
+                    <span>🏆</span> TODAY'S LEADERBOARD
+                    {userRank && totalPlayers > 0 && (
+                      <span className="text-emerald-400 font-normal">
+                        (You: #{userRank} of {totalPlayers})
+                      </span>
+                    )}
+                  </h3>
+                  {leaderboardLoading ? (
+                    <div className="text-zinc-500 text-sm py-2">Loading...</div>
+                  ) : leaderboard.length > 0 ? (
+                    <div className="bg-zinc-800/50 rounded-lg overflow-hidden">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="text-zinc-500 text-xs border-b border-zinc-700">
+                            <th className="py-1 px-2 text-left">#</th>
+                            <th className="py-1 px-2 text-left">Player</th>
+                            <th className="py-1 px-2 text-right">Score</th>
+                            <th className="py-1 px-2 text-right">Time</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {leaderboard.map((entry) => (
+                            <tr 
+                              key={entry.rank} 
+                              className={`border-b border-zinc-700/50 last:border-0 ${
+                                entry.rank === userRank ? 'bg-emerald-900/30' : ''
+                              }`}
+                            >
+                              <td className="py-1.5 px-2 text-left">
+                                {entry.rank === 1 ? '🥇' : entry.rank === 2 ? '🥈' : entry.rank === 3 ? '🥉' : entry.rank}
+                              </td>
+                              <td className="py-1.5 px-2 text-left truncate max-w-[100px]">
+                                {entry.username}
+                              </td>
+                              <td className="py-1.5 px-2 text-right font-mono">
+                                {entry.score.toLocaleString()}
+                              </td>
+                              <td className="py-1.5 px-2 text-right font-mono text-zinc-400">
+                                {formatTime(entry.time)}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="text-zinc-500 text-sm py-2">Be the first to set a score!</div>
+                  )}
+                </div>
+              )}
               
-              {/* Action Buttons: View Original Post (real link), Share (daily), Continue / Next */}
+              {/* Action Buttons: View Original Post, Share to Reddit, Copy, Continue / Next */}
               <div className="flex flex-col gap-2 mt-4">
                 {redditLink && (
                   <a
                     href={redditLink}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="inline-block text-center w-full px-4 sm:px-6 py-2 bg-orange-500 hover:bg-orange-400 rounded-lg font-bold text-sm sm:text-base text-white no-underline"
+                    className="w-full px-4 sm:px-6 py-2 bg-orange-500 hover:bg-orange-400 rounded-lg font-bold text-sm sm:text-base text-white text-center block"
                   >
                     🔗 View Original Post
                   </a>
                 )}
                 {mode === 'daily' && (
-                  <>
+                  <div className="flex gap-2">
                     <button
                       type="button"
                       onClick={async () => {
-                        const shareText = await generateShare();
-                        if (shareText) {
-                          const shareUrl = `https://www.reddit.com/submit?title=${encodeURIComponent(shareText)}`;
-                          window.open(shareUrl, '_blank', 'noopener,noreferrer');
-                        }
-                      }}
-                      className="px-4 sm:px-6 py-2 bg-blue-500 hover:bg-blue-400 rounded-lg font-bold text-sm sm:text-base"
-                    >
-                      📋 Share on Reddit (new tab)
-                    </button>
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        const playLink = typeof window !== 'undefined' ? window.location.href : '';
-                        const text = `I scored ${currentScore.toLocaleString()} in ${formatTime(elapsedTime)} with ${hintsUsed} hint${hintsUsed !== 1 ? 's' : ''} on PostCipher! Play the game: ${playLink}`;
+                        // Copy score text with game link - for sharing anywhere
+                        const text = `I scored ${currentScore.toLocaleString()} in ${formatTime(elapsedTime)} with ${hintsUsed} hint${hintsUsed !== 1 ? 's' : ''} on PostCipher!${gamePostUrl ? `\n\nPlay: ${gamePostUrl}` : ''}`;
                         try {
                           await navigator.clipboard.writeText(text);
-                          alert('Copied to clipboard! Paste anywhere to share.');
+                          setCopyFeedback(true);
+                          setTimeout(() => setCopyFeedback(false), 2500);
                         } catch {
                           alert(`Copy this to share:\n\n${text}`);
                         }
                       }}
-                      className="px-4 sm:px-6 py-2 bg-zinc-600 hover:bg-zinc-500 rounded-lg font-bold text-sm sm:text-base"
+                      className={`flex-1 px-4 sm:px-6 py-2 rounded-lg font-bold text-sm sm:text-base ${
+                        copyFeedback ? 'bg-green-500' : 'bg-zinc-600 hover:bg-zinc-500'
+                      }`}
                     >
-                      📤 Copy to share elsewhere
+                      {copyFeedback ? '✓ Copied!' : '📋 Copy Score'}
                     </button>
-                  </>
+                    <a
+                      href={`https://www.reddit.com/r/PostCipher/submit?title=${encodeURIComponent(`PostCipher - Score: ${currentScore.toLocaleString()} | Time: ${formatTime(elapsedTime)} | Hints: ${hintsUsed}`)}&text=${encodeURIComponent(`I just solved today's PostCipher puzzle!\n\n🏆 Score: ${currentScore.toLocaleString()}\n⏱️ Time: ${formatTime(elapsedTime)}\n💡 Hints used: ${hintsUsed}\n\nCan you beat my score? Play the daily puzzle: ${gamePostUrl || 'https://www.reddit.com/r/PostCipher'}`)}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex-1 px-4 sm:px-6 py-2 rounded-lg font-bold text-sm sm:text-base bg-blue-500 hover:bg-blue-400 text-center"
+                    >
+                      📤 Share to Reddit
+                    </a>
+                  </div>
                 )}
                 {mode === 'daily' && (
                   <button

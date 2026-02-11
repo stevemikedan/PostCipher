@@ -87,7 +87,27 @@ export interface SubmitScoreRequest {
 export interface SubmitScoreResponse {
   type: 'score-submitted';
   score: Score;
-  rank?: number; // Optional leaderboard rank
+  rank?: number; // User's rank on the leaderboard (1-indexed)
+  totalPlayers?: number; // Total players on leaderboard
+}
+
+// ===== Leaderboard API =====
+
+export interface LeaderboardEntry {
+  rank: number;
+  username: string;
+  score: number;
+  time: number;
+  hintsUsed: number;
+}
+
+export interface GetLeaderboardResponse {
+  type: 'leaderboard';
+  puzzleId: string;
+  entries: LeaderboardEntry[];
+  userRank?: number; // Current user's rank if on leaderboard
+  userEntry?: LeaderboardEntry; // Current user's entry if on leaderboard
+  totalPlayers: number;
 }
 
 // ===== Share API =====

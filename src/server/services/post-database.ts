@@ -33,10 +33,14 @@ export async function initializePostDatabase(): Promise<void> {
     // Store all posts in Redis (with cipher-fit attributes for selection)
     const posts: RedditPost[] = CURATED_QUOTES.map((quote, index) => {
       const title = quote.title;
+      const id = `curated-${index}`;
+      const sub = (quote.subreddit || 'r/reddit').replace(/^r\//, '');
       return {
         ...quote,
-        id: `post-${index}`,
-        permalink: `https://reddit.com/${quote.subreddit}`,
+        id,
+        // For curated quotes, use the subreddit link since these aren't real posts
+        // Real posts from Reddit API will have proper permalinks
+        permalink: `/r/${sub}`,
         createdUtc: Date.now() / 1000 - (CURATED_QUOTES.length - index) * 86400,
         cipherFriendly: isCipherFriendly(title),
         difficulty: getDifficulty(title),
@@ -72,6 +76,26 @@ export async function addPostToDatabase(post: RedditPost): Promise<void> {
 }
 
 /**
+ * Build a proper permalink for a post if it doesn't have one
+ */
+function ensureValidPermalink(post: RedditPost): string {
+  const raw = (post.permalink ?? '').trim();
+  // If it already has /comments/, it's a valid post link
+  if (raw.includes('/comments/')) {
+    return raw.startsWith('/') ? raw : `/${raw}`;
+  }
+  // If we have a real Reddit post ID, build the permalink
+  const id = post.id ?? '';
+  if (id && !id.startsWith('curated-') && !id.startsWith('post-')) {
+    const sub = (post.subreddit || 'r/reddit').replace(/^r\//, '');
+    return `/r/${sub}/comments/${id}`;
+  }
+  // For curated posts, just link to the subreddit
+  const sub = (post.subreddit || 'r/reddit').replace(/^r\//, '');
+  return `/r/${sub}`;
+}
+
+/**
  * Sync Reddit posts to the library
  * Adds new posts, updates existing ones (keeps higher upvotes), and trims to max size
  */
@@ -94,6 +118,7 @@ export async function syncRedditPostsToLibrary(
       ...newPost,
       cipherFriendly: newPost.cipherFriendly ?? isCipherFriendly(newPost.title),
       difficulty: newPost.difficulty ?? getDifficulty(newPost.title),
+      permalink: ensureValidPermalink(newPost),
     };
     if (existingPostMap.has(newPost.id)) {
       const index = existingPosts.findIndex((p) => p.id === newPost.id);
@@ -109,10 +134,12 @@ export async function syncRedditPostsToLibrary(
     }
   }
 
-  // Backfill cipherFriendly/difficulty for existing posts that don't have them
+  // Backfill cipherFriendly/difficulty/permalink for existing posts
   for (const post of existingPosts) {
     if (post.cipherFriendly === undefined) (post as RedditPost).cipherFriendly = isCipherFriendly(post.title);
     if (post.difficulty === undefined) (post as RedditPost).difficulty = getDifficulty(post.title);
+    // Fix permalinks for existing posts
+    (post as RedditPost).permalink = ensureValidPermalink(post);
   }
 
   existingPosts.sort((a, b) => b.upvotes - a.upvotes);
@@ -123,6 +150,34 @@ export async function syncRedditPostsToLibrary(
 
   console.log(`Synced ${newPosts.length} posts: ${newPostsAdded} new, ${trimmedPosts.length} total in library`);
   return newPostsAdded;
+}
+
+/**
+ * Fix permalinks for all existing posts in the library
+ * Call this to repair posts that were saved with bad/missing permalinks
+ */
+export async function repairLibraryPermalinks(): Promise<number> {
+  const existingJson = await redis.get(POST_DB_KEY);
+  if (!existingJson) return 0;
+
+  const posts: RedditPost[] = JSON.parse(existingJson);
+  let fixedCount = 0;
+
+  for (const post of posts) {
+    const oldPermalink = post.permalink;
+    const newPermalink = ensureValidPermalink(post);
+    if (oldPermalink !== newPermalink) {
+      post.permalink = newPermalink;
+      fixedCount++;
+    }
+  }
+
+  if (fixedCount > 0) {
+    await redis.set(POST_DB_KEY, JSON.stringify(posts));
+    console.log(`Fixed permalinks for ${fixedCount} posts`);
+  }
+
+  return fixedCount;
 }
 
 /**

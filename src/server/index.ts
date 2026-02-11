@@ -14,13 +14,15 @@ import type {
   SaveProgressResponse,
   PlayHistoryEntry,
   ErrorResponse,
+  GetLeaderboardResponse,
+  LeaderboardEntry,
 } from '../shared/types/api';
 import { redis, reddit, createServer, context, getServerPort } from '@devvit/web/server';
 import { createPost } from './core/post';
 import { getDailyPuzzle, getPracticePuzzle, validatePuzzle } from './services/puzzle';
 import { calculateScore, generateShareText, formatTime } from '../shared/types/puzzle';
 import { getRedditPostUrl } from '../shared/reddit-link';
-import { initializePostDatabase, getAvailableSubreddits } from './services/post-database';
+import { initializePostDatabase, getAvailableSubreddits, repairLibraryPermalinks } from './services/post-database';
 
 const app = express();
 
@@ -142,6 +144,89 @@ router.post('/internal/menu/post-create', async (_req, res): Promise<void> => {
     });
   }
 });
+
+// ===== Post URL Endpoint =====
+
+/**
+ * Get the current post's Reddit URL (short, clean link to the game post).
+ * Used for sharing so users get a proper Reddit link, not the long webview URL.
+ */
+router.get<unknown, { postUrl: string } | ErrorResponse>(
+  '/api/post-url',
+  async (_req, res): Promise<void> => {
+    try {
+      const { postId, subredditName } = context;
+      if (!postId || !subredditName) {
+        res.status(400).json({
+          status: 'error',
+          message: 'Post context not available',
+        });
+        return;
+      }
+      const cleanPostId = postId.replace(/^t3_/, '');
+      const postUrl = `https://www.reddit.com/r/${subredditName}/comments/${cleanPostId}`;
+      res.json({ postUrl });
+    } catch (error) {
+      console.error('Error getting post URL:', error);
+      res.status(500).json({
+        status: 'error',
+        message: error instanceof Error ? error.message : 'Failed to get post URL',
+      });
+    }
+  }
+);
+
+// ===== Admin Endpoints =====
+
+/**
+ * Clear the daily puzzle cache (forces regeneration on next request).
+ * Useful for testing or fixing cached puzzles with bad data.
+ */
+router.post<unknown, { status: string; message: string }>(
+  '/api/admin/clear-daily-cache',
+  async (_req, res): Promise<void> => {
+    try {
+      const dateString = new Date().toISOString().split('T')[0];
+      const cacheKey = `puzzle:daily:${dateString}`;
+      await redis.delete(cacheKey);
+      await redis.delete('puzzle:daily:cached');
+      console.log(`Cleared daily puzzle cache for ${dateString}`);
+      res.json({ status: 'success', message: `Cleared daily puzzle cache for ${dateString}` });
+    } catch (error) {
+      console.error('Error clearing cache:', error);
+      res.status(500).json({
+        status: 'error',
+        message: error instanceof Error ? error.message : 'Failed to clear cache',
+      });
+    }
+  }
+);
+
+/**
+ * Repair permalinks for all posts in the library.
+ * Fixes posts that were saved with bad or missing permalinks.
+ */
+router.post<unknown, { status: string; message: string; fixedCount: number }>(
+  '/api/admin/repair-library',
+  async (_req, res): Promise<void> => {
+    try {
+      const fixedCount = await repairLibraryPermalinks();
+      console.log(`Repaired library: ${fixedCount} posts fixed`);
+      res.json({ 
+        status: 'success', 
+        message: `Repaired ${fixedCount} posts with bad permalinks`,
+        fixedCount 
+      });
+    } catch (error) {
+      console.error('Error repairing library:', error);
+      res.status(500).json({
+        status: 'error',
+        message: error instanceof Error ? error.message : 'Failed to repair library',
+        fixedCount: 0,
+      });
+    }
+  }
+);
 
 // ===== Puzzle API Endpoints =====
 
@@ -493,9 +578,52 @@ router.post<unknown, SubmitScoreResponse | ErrorResponse, SubmitScoreRequest>(
         username,
       };
 
+      let rank: number | undefined;
+      let totalPlayers: number | undefined;
+
       if (mode === 'daily') {
         const scoreKey = `score:${puzzleId}:${username}`;
         await redis.set(scoreKey, JSON.stringify(scoreData));
+
+        // Add to daily leaderboard sorted set (score as the sort value, higher is better)
+        // Store entry data as JSON member, score as the zset score
+        const leaderboardKey = `leaderboard:${puzzleId}`;
+        const entryData = JSON.stringify({ username, score, time, hintsUsed });
+        
+        // Check if user already has an entry (only keep best score)
+        const existingEntries = await redis.zRange(leaderboardKey, 0, -1);
+        for (const existing of existingEntries) {
+          try {
+            const parsed = JSON.parse(existing.member);
+            if (parsed.username === username) {
+              // User already has entry - only update if new score is better
+              if (score > parsed.score) {
+                await redis.zRem(leaderboardKey, [existing.member]);
+              } else {
+                // Keep existing better score, just get rank
+                const existingRank = await redis.zRank(leaderboardKey, existing.member);
+                totalPlayers = existingEntries.length;
+                // zRank is 0-indexed from lowest, we want rank from highest
+                rank = existingRank !== undefined ? totalPlayers - existingRank : undefined;
+                break;
+              }
+            }
+          } catch {
+            // Skip malformed entries
+          }
+        }
+
+        // Add the score (if not skipped above due to existing better score)
+        if (rank === undefined) {
+          await redis.zAdd(leaderboardKey, { member: entryData, score });
+          
+          // Get user's rank (zRank returns 0-indexed from lowest score)
+          const zRank = await redis.zRank(leaderboardKey, entryData);
+          const count = await redis.zCard(leaderboardKey);
+          totalPlayers = count;
+          // Convert to 1-indexed rank from highest score
+          rank = zRank !== undefined ? count - zRank : undefined;
+        }
       }
 
       // Append to play history (for success rate, past plays, view original posts)
@@ -521,6 +649,8 @@ router.post<unknown, SubmitScoreResponse | ErrorResponse, SubmitScoreRequest>(
       res.json({
         type: 'score-submitted',
         score: scoreData,
+        rank,
+        totalPlayers,
       });
     } catch (error) {
       console.error('Error submitting score:', error);
@@ -546,6 +676,92 @@ router.get<unknown, GetScoreHistoryResponse | ErrorResponse>(
       res.status(500).json({
         status: 'error',
         message: error instanceof Error ? error.message : 'Failed to get history',
+      });
+    }
+  }
+);
+
+// ===== Leaderboard API Endpoints =====
+
+/**
+ * Get the daily leaderboard for a specific puzzle.
+ * Returns top 10 scores plus the current user's rank if they're on the board.
+ */
+router.get<unknown, GetLeaderboardResponse | ErrorResponse, unknown, { puzzleId?: string }>(
+  '/api/leaderboard/daily',
+  async (req, res): Promise<void> => {
+    try {
+      // Get puzzleId from query param, or use current daily puzzle
+      let puzzleId = req.query.puzzleId;
+      if (!puzzleId) {
+        // Default to current daily puzzle
+        const cachedPuzzle = await redis.get('puzzle:daily:cached');
+        if (cachedPuzzle) {
+          const parsed = JSON.parse(cachedPuzzle);
+          puzzleId = parsed.id;
+        }
+      }
+
+      if (!puzzleId) {
+        res.status(400).json({
+          status: 'error',
+          message: 'puzzleId is required',
+        });
+        return;
+      }
+
+      const username = (await reddit.getCurrentUsername()) || 'anonymous';
+      const leaderboardKey = `leaderboard:${puzzleId}`;
+
+      // Get all entries sorted by score (highest first)
+      // zRange with rev: true returns highest to lowest
+      const allEntries = await redis.zRange(leaderboardKey, 0, -1, { by: 'rank', reverse: true });
+      const totalPlayers = allEntries.length;
+
+      // Parse entries and build leaderboard
+      const entries: LeaderboardEntry[] = [];
+      let userRank: number | undefined;
+      let userEntry: LeaderboardEntry | undefined;
+
+      for (let i = 0; i < allEntries.length; i++) {
+        try {
+          const parsed = JSON.parse(allEntries[i].member);
+          const entry: LeaderboardEntry = {
+            rank: i + 1,
+            username: parsed.username,
+            score: parsed.score,
+            time: parsed.time,
+            hintsUsed: parsed.hintsUsed,
+          };
+
+          // Track top 10 for display
+          if (i < 10) {
+            entries.push(entry);
+          }
+
+          // Track current user's position
+          if (parsed.username === username) {
+            userRank = i + 1;
+            userEntry = entry;
+          }
+        } catch {
+          // Skip malformed entries
+        }
+      }
+
+      res.json({
+        type: 'leaderboard',
+        puzzleId,
+        entries,
+        userRank,
+        userEntry,
+        totalPlayers,
+      });
+    } catch (error) {
+      console.error('Error getting leaderboard:', error);
+      res.status(500).json({
+        status: 'error',
+        message: error instanceof Error ? error.message : 'Failed to get leaderboard',
       });
     }
   }
