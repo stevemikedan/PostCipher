@@ -404,7 +404,7 @@ export async function fetchRandomPost(subreddit?: string): Promise<RedditPost | 
 
 /**
  * Get post by ID from Reddit (t3_ prefix optional)
- * Uses Devvit getPostById first, then HTTP fallback
+ * Uses Devvit getPostById API
  */
 export async function getPostById(postId: string): Promise<RedditPost | null> {
   const fullId = postId.startsWith('t3_') ? postId : `t3_${postId}`;
@@ -416,31 +416,5 @@ export async function getPostById(postId: string): Promise<RedditPost | null> {
   } catch (err) {
     console.error(`Devvit getPostById(${fullId}) failed:`, err);
   }
-
-  try {
-    const response = await fetch(`https://www.reddit.com/api/info.json?id=${fullId}`, {
-      headers: { 'User-Agent': 'PostCipher/1.0' },
-    });
-    if (!response.ok) return null;
-    const data = await response.json();
-    const items = data.data?.children || [];
-    if (items.length === 0) return null;
-    const post = items[0].data;
-    if (!post) return null;
-    const permalink = post.permalink
-      ? post.permalink.startsWith('/') ? post.permalink : `/${post.permalink}`
-      : `/r/${post.subreddit}/comments/${post.id}`;
-    return {
-      id: post.id,
-      title: post.title || '',
-      subreddit: `r/${post.subreddit || 'unknown'}`,
-      author: post.author || 'unknown',
-      upvotes: post.score || 0,
-      permalink,
-      createdUtc: post.created_utc || Date.now() / 1000,
-    };
-  } catch (error) {
-    console.error(`Error fetching post ${postId}:`, error);
-    return null;
-  }
+  return null;
 }
