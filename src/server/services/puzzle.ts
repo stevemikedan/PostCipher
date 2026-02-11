@@ -8,21 +8,17 @@ import {
   getPracticePuzzleSeed,
 } from '../../shared/cryptogram/engine';
 import type { Puzzle, RedditPost } from '../../shared/types/puzzle';
-import { getDailyPost, getRandomPost } from './post-database';
-import { fetchTrendingPosts, fetchRandomPost as fetchRedditPost } from './reddit';
-
-/**
- * Hash a string to a number (deterministic)
- */
-function hashString(str: string): number {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    const char = str.charCodeAt(i);
-    hash = (hash << 5) - hash + char;
-    hash = hash & hash; // Convert to 32-bit integer
-  }
-  return Math.abs(hash);
-}
+import {
+  getDailyPost,
+  getRandomPost,
+  selectPostFromPool,
+  syncRedditPostsToLibrary,
+} from './post-database';
+import {
+  fetchTrendingPosts,
+  fetchRandomPost as fetchRedditPost,
+  fetchPostsForSubreddit,
+} from './reddit';
 
 const PUZZLE_CACHE_PREFIX = 'puzzle:daily:';
 const PUZZLE_NUMBER_KEY = 'puzzle:number';
@@ -100,27 +96,23 @@ export async function getDailyPuzzle(date: Date = new Date()): Promise<Puzzle> {
 
   // Generate new puzzle using hash-based post selection
   const puzzleNumber = await getPuzzleNumber();
-  
-  // Normalize date for seed generation (needed regardless of source)
   const normalizedDate = new Date(dateString + 'T00:00:00Z');
-  
-  // Try to fetch from Reddit API first, fallback to database
+
+  // Prefer library first for fast response; refresh library in background for next time
   let source: RedditPost;
   try {
-    const redditPosts = await fetchTrendingPosts(100);
-    if (redditPosts.length > 0) {
-      // Use date hash to deterministically select from Reddit posts
-      const hash = hashString(`daily-${dateString}`);
-      const index = hash % redditPosts.length;
-      source = redditPosts[index];
-      console.log(`Selected Reddit post ${index} from ${redditPosts.length} posts for ${dateString}`);
-    } else {
-      throw new Error('No Reddit posts available');
-    }
-  } catch (error) {
-    console.error('Error fetching from Reddit, using database:', error);
-    // Fallback to database
     source = await getDailyPost(normalizedDate);
+    refreshLibraryInBackground();
+  } catch (error) {
+    console.error('Daily puzzle: no post in library, syncing from Reddit:', error);
+    try {
+      const redditPosts = await fetchTrendingPosts(100);
+      if (redditPosts.length > 0) await syncRedditPostsToLibrary(redditPosts);
+      source = await getDailyPost(normalizedDate);
+    } catch (err2) {
+      console.error('Error in daily puzzle (Reddit sync or getDailyPost):', err2);
+      source = await getDailyPost(normalizedDate);
+    }
   }
 
   const puzzleId = `daily-${dateString}`;
@@ -151,46 +143,84 @@ export async function getDailyPuzzle(date: Date = new Date()): Promise<Puzzle> {
 }
 
 /**
- * Generate a practice puzzle
- * Tries Reddit API first, falls back to database
- * Optionally filter by subreddit
+ * Fire-and-forget: fetch from Reddit and sync to library so future practice loads stay fresh.
+ * Does not block the response.
  */
-export async function getPracticePuzzle(subreddit?: string): Promise<Puzzle> {
-  let source: RedditPost;
-  
-  console.log(`Getting practice puzzle${subreddit ? ` for ${subreddit}` : ''}`);
-  
-  try {
-    // Try Reddit API first
-    const redditPost = await fetchRedditPost(subreddit);
-    if (redditPost) {
-      source = redditPost;
-      console.log(`Using Reddit post from ${source.subreddit} (requested: ${subreddit || 'any'})`);
-      
-      // Verify subreddit matches if one was requested
+function refreshLibraryInBackground(subreddit?: string): void {
+  void (async () => {
+    try {
       if (subreddit) {
-        const requestedNormalized = subreddit.toLowerCase().replace(/^r\//, '');
-        const actualNormalized = source.subreddit.toLowerCase().replace(/^r\//, '');
-        if (requestedNormalized !== actualNormalized) {
-          console.warn(`Subreddit mismatch: requested ${subreddit}, got ${source.subreddit}`);
+        const batch = await fetchPostsForSubreddit(subreddit, 50);
+        if (batch.length > 0) await syncRedditPostsToLibrary(batch);
+      } else {
+        const posts = await fetchTrendingPosts(50);
+        if (posts.length > 0) await syncRedditPostsToLibrary(posts);
+      }
+    } catch (e) {
+      console.warn('Background library refresh failed:', e);
+    }
+  })();
+}
+
+/**
+ * Generate a practice puzzle.
+ * Uses library first for fast load; refreshes library in the background for next time.
+ * Falls back to Reddit fetch only when the library is empty or has no posts for the subreddit.
+ */
+export async function getPracticePuzzle(
+  subreddit?: string,
+  requestSeed?: number | string
+): Promise<Puzzle> {
+  let source: RedditPost;
+  const seedForSelection = requestSeed ?? Date.now();
+
+  console.log(`Getting practice puzzle${subreddit ? ` for ${subreddit}` : ''}`);
+
+  // Fast path: try library first so we can return immediately
+  try {
+    source = await getRandomPost(subreddit, seedForSelection);
+    console.log(`Using library post from ${source.subreddit}`);
+    refreshLibraryInBackground(subreddit);
+  } catch {
+    // Slow path: library empty or no posts for subreddit — fetch from Reddit, sync, then use result
+    if (subreddit) {
+      try {
+        const batch = await fetchPostsForSubreddit(subreddit, 50);
+        if (batch.length > 0) {
+          await syncRedditPostsToLibrary(batch);
+          source = selectPostFromPool(batch, seedForSelection);
+          console.log(
+            `Using post from ${source.subreddit} (selected from batch of ${batch.length} by seed)`
+          );
+        } else {
+          throw new Error('No posts returned for subreddit');
+        }
+      } catch (error) {
+        console.error(
+          `Error fetching batch for ${subreddit}, using library:`,
+          error
+        );
+        try {
+          source = await getRandomPost(subreddit, seedForSelection);
+          console.log(`Using database post from ${source.subreddit}`);
+        } catch {
+          source = await getRandomPost(undefined, seedForSelection);
         }
       }
     } else {
-      throw new Error('No Reddit post found');
-    }
-  } catch (error) {
-    console.error(`Error fetching from Reddit${subreddit ? ` for ${subreddit}` : ''}, using database:`, error);
-    // Fallback to database - this will also filter by subreddit if provided
-    try {
-      source = await getRandomPost(subreddit);
-      console.log(`Using database post from ${source.subreddit} (requested: ${subreddit || 'any'})`);
-    } catch (dbError) {
-      // If database also fails and subreddit was specified, try without filter
-      if (subreddit) {
-        console.warn(`No posts found for ${subreddit} in database, trying without filter`);
-        source = await getRandomPost();
-      } else {
-        throw dbError;
+      try {
+        const redditPost = await fetchRedditPost();
+        if (redditPost) {
+          source = redditPost;
+          await syncRedditPostsToLibrary([source]);
+          console.log(`Using Reddit post from ${source.subreddit}`);
+        } else {
+          throw new Error('No Reddit post found');
+        }
+      } catch (error) {
+        console.error('Error fetching from Reddit, using database:', error);
+        source = await getRandomPost(undefined, seedForSelection);
+        console.log(`Using database post from ${source.subreddit}`);
       }
     }
   }

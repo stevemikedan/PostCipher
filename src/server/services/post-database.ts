@@ -1,11 +1,21 @@
 // Post database system for deterministic daily puzzle selection
 
 import { redis } from '@devvit/web/server';
+import { getDifficulty, isCipherFriendly } from '../../shared/cryptogram/cipher-fit';
 import type { RedditPost } from '../../shared/types/puzzle';
 import { CURATED_QUOTES } from './puzzle-library';
 
+/** Whether a post is a good fit for substitution cipher (stored or computed from title) */
+function postIsCipherFriendly(post: RedditPost): boolean {
+  return post.cipherFriendly ?? isCipherFriendly(post.title);
+}
+
 const POST_DB_KEY = 'postcipher:posts:all';
 const POST_COUNT_KEY = 'postcipher:posts:count';
+const DAILY_USED_POSTS_KEY = 'postcipher:daily:used';
+
+/** Max posts to keep in library (Redis handles 10k+ efficiently) */
+export const MAX_DB_SIZE = 10000;
 
 /**
  * Initialize the post database in Redis
@@ -20,13 +30,22 @@ export async function initializePostDatabase(): Promise<void> {
       return;
     }
 
-    // Store all posts in Redis
-    const posts: RedditPost[] = CURATED_QUOTES.map((quote, index) => ({
-      ...quote,
-      id: `post-${index}`,
-      permalink: `https://reddit.com/${quote.subreddit}`,
-      createdUtc: Date.now() / 1000 - (CURATED_QUOTES.length - index) * 86400, // Stagger dates
-    }));
+    // Store all posts in Redis (with cipher-fit attributes for selection)
+    const posts: RedditPost[] = CURATED_QUOTES.map((quote, index) => {
+      const title = quote.title;
+      const id = `curated-${index}`;
+      const sub = (quote.subreddit || 'r/reddit').replace(/^r\//, '');
+      return {
+        ...quote,
+        id,
+        // For curated quotes, use the subreddit link since these aren't real posts
+        // Real posts from Reddit API will have proper permalinks
+        permalink: `/r/${sub}`,
+        createdUtc: Date.now() / 1000 - (CURATED_QUOTES.length - index) * 86400,
+        cipherFriendly: isCipherFriendly(title),
+        difficulty: getDifficulty(title),
+      };
+    });
 
     // Store posts as JSON array
     await redis.set(POST_DB_KEY, JSON.stringify(posts));
@@ -54,6 +73,137 @@ export async function addPostToDatabase(post: RedditPost): Promise<void> {
   
   await redis.set(POST_DB_KEY, JSON.stringify(posts));
   await redis.set(POST_COUNT_KEY, posts.length.toString());
+}
+
+/**
+ * Build a proper permalink for a post if it doesn't have one
+ */
+function ensureValidPermalink(post: RedditPost): string {
+  const raw = (post.permalink ?? '').trim();
+  // If it already has /comments/, it's a valid post link
+  if (raw.includes('/comments/')) {
+    return raw.startsWith('/') ? raw : `/${raw}`;
+  }
+  // If we have a real Reddit post ID, build the permalink
+  const id = post.id ?? '';
+  if (id && !id.startsWith('curated-') && !id.startsWith('post-')) {
+    const sub = (post.subreddit || 'r/reddit').replace(/^r\//, '');
+    return `/r/${sub}/comments/${id}`;
+  }
+  // For curated posts, just link to the subreddit
+  const sub = (post.subreddit || 'r/reddit').replace(/^r\//, '');
+  return `/r/${sub}`;
+}
+
+/**
+ * Sync Reddit posts to the library
+ * Adds new posts, updates existing ones (keeps higher upvotes), and trims to max size
+ */
+export async function syncRedditPostsToLibrary(
+  newPosts: RedditPost[],
+  maxSize: number = MAX_DB_SIZE
+): Promise<number> {
+  await initializePostDatabase();
+
+  const existingJson = await redis.get(POST_DB_KEY);
+  const existingPosts: RedditPost[] = existingJson ? JSON.parse(existingJson) : [];
+
+  const existingPostMap = new Map<string, RedditPost>();
+  existingPosts.forEach((post) => existingPostMap.set(post.id, post));
+
+  let newPostsAdded = 0;
+
+  for (const newPost of newPosts) {
+    const withAttrs = {
+      ...newPost,
+      cipherFriendly: newPost.cipherFriendly ?? isCipherFriendly(newPost.title),
+      difficulty: newPost.difficulty ?? getDifficulty(newPost.title),
+      permalink: ensureValidPermalink(newPost),
+    };
+    if (existingPostMap.has(newPost.id)) {
+      const index = existingPosts.findIndex((p) => p.id === newPost.id);
+      if (index !== -1) {
+        existingPosts[index] = {
+          ...withAttrs,
+          upvotes: Math.max(existingPosts[index].upvotes, newPost.upvotes),
+        };
+      }
+    } else {
+      existingPosts.push(withAttrs);
+      newPostsAdded++;
+    }
+  }
+
+  // Backfill cipherFriendly/difficulty/permalink for existing posts
+  for (const post of existingPosts) {
+    if (post.cipherFriendly === undefined) (post as RedditPost).cipherFriendly = isCipherFriendly(post.title);
+    if (post.difficulty === undefined) (post as RedditPost).difficulty = getDifficulty(post.title);
+    // Fix permalinks for existing posts
+    (post as RedditPost).permalink = ensureValidPermalink(post);
+  }
+
+  existingPosts.sort((a, b) => b.upvotes - a.upvotes);
+  const trimmedPosts = existingPosts.slice(0, maxSize);
+
+  await redis.set(POST_DB_KEY, JSON.stringify(trimmedPosts));
+  await redis.set(POST_COUNT_KEY, trimmedPosts.length.toString());
+
+  console.log(`Synced ${newPosts.length} posts: ${newPostsAdded} new, ${trimmedPosts.length} total in library`);
+  return newPostsAdded;
+}
+
+/**
+ * Fix permalinks for all existing posts in the library
+ * Call this to repair posts that were saved with bad/missing permalinks
+ */
+export async function repairLibraryPermalinks(): Promise<number> {
+  const existingJson = await redis.get(POST_DB_KEY);
+  if (!existingJson) return 0;
+
+  const posts: RedditPost[] = JSON.parse(existingJson);
+  let fixedCount = 0;
+
+  for (const post of posts) {
+    const oldPermalink = post.permalink;
+    const newPermalink = ensureValidPermalink(post);
+    if (oldPermalink !== newPermalink) {
+      post.permalink = newPermalink;
+      fixedCount++;
+    }
+  }
+
+  if (fixedCount > 0) {
+    await redis.set(POST_DB_KEY, JSON.stringify(posts));
+    console.log(`Fixed permalinks for ${fixedCount} posts`);
+  }
+
+  return fixedCount;
+}
+
+/**
+ * Get set of post IDs that have been used for daily puzzles
+ */
+async function getUsedDailyPostIds(): Promise<Set<string>> {
+  const usedJson = await redis.get(DAILY_USED_POSTS_KEY);
+  if (!usedJson) return new Set();
+  return new Set(JSON.parse(usedJson) as string[]);
+}
+
+/**
+ * Mark a post as used for daily puzzle
+ */
+async function markPostAsUsedForDaily(postId: string): Promise<void> {
+  const usedIds = await getUsedDailyPostIds();
+  usedIds.add(postId);
+  await redis.set(DAILY_USED_POSTS_KEY, JSON.stringify(Array.from(usedIds)));
+}
+
+/**
+ * Reset used posts tracking (e.g. after ~1 year or when running low on unused posts)
+ */
+export async function resetUsedDailyPosts(): Promise<void> {
+  await redis.delete(DAILY_USED_POSTS_KEY);
+  console.log('Reset daily puzzle used posts tracking');
 }
 
 /**
@@ -96,64 +246,106 @@ function hashString(str: string): number {
 
 /**
  * Get daily puzzle post using hash-based selection
- * This ensures everyone gets the same post on the same day
+ * Ensures same post for everyone on same day; prevents repeats by tracking used posts
+ * Uses stable ordering (sort by post ID) so selection does not depend on database size
  */
 export async function getDailyPost(date: Date = new Date()): Promise<RedditPost> {
   await initializePostDatabase();
-  
-  // Normalize to UTC date string to ensure consistency
+
   const dateString = date.toISOString().split('T')[0];
-  const posts = await getAllPosts();
-  
-  if (posts.length === 0) {
+  const allPosts = await getAllPosts();
+
+  if (allPosts.length === 0) {
     throw new Error('No posts available in database');
   }
-  
-  // Use date string as seed for deterministic selection
-  // This ensures same date = same hash = same post for all users
+
+  const usedIds = await getUsedDailyPostIds();
+  const availablePosts = allPosts.filter((post) => !usedIds.has(post.id));
+
+  // Prefer cipher-friendly posts (no digits, mostly letters) for better puzzle experience
+  const cipherFriendlyPool = availablePosts.filter(postIsCipherFriendly);
+  const selectionPool = cipherFriendlyPool.length > 0 ? cipherFriendlyPool : availablePosts;
+
+  // If we've used most posts, reset tracking (e.g. after ~1 year)
+  if (availablePosts.length < allPosts.length * 0.1) {
+    console.log(`Low on unused posts (${availablePosts.length}/${allPosts.length}), resetting tracking`);
+    await resetUsedDailyPosts();
+    const hash = hashString(`daily-${dateString}`);
+    const index = hash % allPosts.length;
+    const selectedPost = allPosts[index];
+    await markPostAsUsedForDaily(selectedPost.id);
+    console.log(`Selected post ${index} from ${allPosts.length} posts for ${dateString} (hash: ${hash})`);
+    return selectedPost;
+  }
+
+  // Stable ordering by post ID so selection does not change when DB size changes
+  const sortedPosts = [...selectionPool].sort((a, b) => a.id.localeCompare(b.id));
   const hash = hashString(`daily-${dateString}`);
-  const index = hash % posts.length;
-  
-  console.log(`Selected post ${index} from ${posts.length} posts for date ${dateString} (hash: ${hash})`);
-  
-  return posts[index];
+  const index = hash % sortedPosts.length;
+  const selectedPost = sortedPosts[index];
+
+  await markPostAsUsedForDaily(selectedPost.id);
+  console.log(
+    `Selected unused post ${index} from ${sortedPosts.length} available (${allPosts.length} total, cipher-friendly pool: ${cipherFriendlyPool.length}) for ${dateString}`
+  );
+
+  return selectedPost;
+}
+
+/**
+ * Select one post from a given array using a deterministic seed (same seed = same post).
+ * Prefers cipher-friendly posts. Use this when you have a fresh batch (e.g. from Reddit) so
+ * selection uses that batch instead of the full library.
+ */
+export function selectPostFromPool(posts: RedditPost[], seed: number | string): RedditPost {
+  if (posts.length === 0) throw new Error('No posts in pool');
+  const cipherFriendlyPool = posts.filter(postIsCipherFriendly);
+  const selectionPool = cipherFriendlyPool.length > 0 ? cipherFriendlyPool : posts;
+  const seedHash = hashString(`practice-${seed}-pool`);
+  const randomIndex = seedHash % selectionPool.length;
+  return selectionPool[randomIndex];
 }
 
 /**
  * Get a random post for practice mode
- * Optionally filter by subreddit
- * Uses timestamp-based seed to ensure variety between requests
+ * Optionally filter by subreddit; optional seed ensures different post per "New Puzzle" click
  */
-export async function getRandomPost(subreddit?: string): Promise<RedditPost> {
+export async function getRandomPost(
+  subreddit?: string,
+  seed?: number | string
+): Promise<RedditPost> {
   await initializePostDatabase();
-  
+
   let posts = await getAllPosts();
-  
-  // Filter by subreddit if specified
+
   if (subreddit) {
     const normalizedSubreddit = subreddit.toLowerCase().replace(/^r\//, '');
-    posts = posts.filter((post) => 
-      post.subreddit.toLowerCase().replace(/^r\//, '') === normalizedSubreddit
+    posts = posts.filter(
+      (post) =>
+        post.subreddit.toLowerCase().replace(/^r\//, '') === normalizedSubreddit
     );
-    
     if (posts.length === 0) {
       throw new Error(`No posts found for subreddit: ${subreddit}`);
     }
   }
-  
+
   if (posts.length === 0) {
     throw new Error('No posts available in database');
   }
-  
-  // Use timestamp-based seed for better variety (changes every second)
-  // This ensures different puzzles even when there are only a few options
-  const timestampSeed = Math.floor(Date.now() / 1000); // Changes every second
-  const seedHash = hashString(`practice-${timestampSeed}-${subreddit || 'all'}`);
-  const randomIndex = seedHash % posts.length;
-  
-  console.log(`Selected post ${randomIndex} from ${posts.length} posts${subreddit ? ` for ${subreddit}` : ''} (seed: ${seedHash})`);
-  
-  return posts[randomIndex];
+
+  // Prefer cipher-friendly posts; fall back to all if none match
+  const cipherFriendlyPool = posts.filter(postIsCipherFriendly);
+  const selectionPool = cipherFriendlyPool.length > 0 ? cipherFriendlyPool : posts;
+
+  const seedKey = seed ?? Date.now();
+  const seedHash = hashString(`practice-${seedKey}-${subreddit || 'all'}`);
+  const randomIndex = seedHash % selectionPool.length;
+
+  console.log(
+    `Selected post ${randomIndex} from ${selectionPool.length} posts${subreddit ? ` for ${subreddit}` : ''} (seed: ${seedHash}, cipher-friendly pool: ${cipherFriendlyPool.length})`
+  );
+
+  return selectionPool[randomIndex];
 }
 
 /**

@@ -1,6 +1,6 @@
 // Hook for managing cryptogram game state
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   Puzzle,
   GameState,
@@ -11,9 +11,11 @@ import type {
   GetPracticePuzzleResponse,
   ValidatePuzzleResponse,
   SubmitScoreResponse,
+  PlayHistoryEntry,
 } from '../../shared/types/api';
 import { generateCipherMap } from '../../shared/cryptogram/engine';
 import { calculateScore } from '../../shared/types/puzzle';
+import { getRedditPostUrl } from '../../shared/reddit-link';
 
 interface UseCryptogramOptions {
   mode: 'daily' | 'practice';
@@ -35,17 +37,31 @@ export const useCryptogram = (options: UseCryptogramOptions) => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [score, setScore] = useState<Score | null>(null);
+  /** Ensures each "New Puzzle" request gets a unique seed so the server picks a different post */
+  const practiceSeedRef = useRef(0);
+  /** When true, skip the next effect-driven load (e.g. after resuming from history) */
+  const skipNextLoadRef = useRef(false);
+  /** Prevent submitting score more than once per puzzle (validate can fire multiple times) */
+  const submittedPuzzleIdsRef = useRef<Set<string>>(new Set());
 
   // Load puzzle
   useEffect(() => {
+    if (skipNextLoadRef.current) {
+      skipNextLoadRef.current = false;
+      return;
+    }
     const loadPuzzle = async () => {
       setLoading(true);
       setError(null);
       setScore(null);
       try {
         let endpoint = options.mode === 'daily' ? '/api/puzzle/daily' : '/api/puzzle/practice';
-        if (options.mode === 'practice' && options.subreddit) {
-          endpoint += `?subreddit=${encodeURIComponent(options.subreddit)}`;
+        if (options.mode === 'practice') {
+          const params = new URLSearchParams();
+          if (options.subreddit) params.set('subreddit', options.subreddit);
+          practiceSeedRef.current += 1;
+          params.set('seed', String(practiceSeedRef.current));
+          endpoint += `?${params.toString()}`;
         }
         const res = await fetch(endpoint);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -53,17 +69,23 @@ export const useCryptogram = (options: UseCryptogramOptions) => {
         const data: GetDailyPuzzleResponse | GetPracticePuzzleResponse = await res.json();
         const puzzle = data.puzzle;
 
+        // If daily and user already completed today, show completed state
+        const dailyData = data as GetDailyPuzzleResponse;
+        const completed = options.mode === 'daily' && dailyData.completed && dailyData.completedScore;
+        const cs = dailyData.completedScore;
+
         setGameState({
           puzzle,
-          userMappings: {},
+          userMappings: {}, // will show solved quote in modal
           selectedCipher: null,
-          hintsUsed: 0,
+          hintsUsed: completed && cs ? cs.hintsUsed : 0,
           hintsRevealed: [],
-          isSolved: false,
+          isSolved: !!completed,
           startTime: Date.now(),
-          elapsedTime: 0,
-          mistakes: 0,
+          elapsedTime: completed && cs ? cs.time : 0,
+          mistakes: completed && cs ? cs.mistakes : 0,
         });
+        if (completed && cs) setScore(cs);
       } catch (err) {
         console.error('Failed to load puzzle', err);
         setError(err instanceof Error ? err.message : 'Failed to load puzzle');
@@ -100,6 +122,9 @@ export const useCryptogram = (options: UseCryptogramOptions) => {
         body: JSON.stringify({
           puzzleId: gameState.puzzle.id,
           userMappings: gameState.userMappings,
+          ...(gameState.puzzle.id.startsWith('practice-')
+            ? { seed: gameState.puzzle.seed, cipherText: gameState.puzzle.cipherText }
+            : {}),
         }),
       });
 
@@ -109,8 +134,13 @@ export const useCryptogram = (options: UseCryptogramOptions) => {
       if (data.isSolved) {
         setGameState((prev) => ({ ...prev, isSolved: true }));
 
-        // Submit score for both daily and practice modes
+        if (submittedPuzzleIdsRef.current.has(gameState.puzzle.id)) return;
+        submittedPuzzleIdsRef.current.add(gameState.puzzle.id);
+
+        // Submit score once per puzzle for both daily and practice (and store for history)
         try {
+          const src = gameState.puzzle.source;
+          const postLink = getRedditPostUrl(src);
           const scoreRes = await fetch('/api/score/submit', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -120,6 +150,9 @@ export const useCryptogram = (options: UseCryptogramOptions) => {
               hintsUsed: gameState.hintsUsed,
               mistakes: gameState.mistakes,
               mode: options.mode,
+              postLink,
+              subreddit: src.subreddit ?? '',
+              title: src.title ?? '',
             }),
           });
 
@@ -290,18 +323,44 @@ export const useCryptogram = (options: UseCryptogramOptions) => {
     }
   }, [gameState.puzzle, gameState.isSolved, gameState.elapsedTime, gameState.hintsUsed, options.mode, currentScore]);
 
+  const saveProgress = useCallback(async () => {
+    if (!gameState.puzzle || gameState.isSolved) return;
+    const src = gameState.puzzle.source;
+    const postLink = getRedditPostUrl(src);
+    try {
+      await fetch('/api/progress/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          puzzleId: gameState.puzzle.id,
+          puzzle: gameState.puzzle,
+          userMappings: gameState.userMappings,
+          elapsedTime: gameState.elapsedTime,
+          hintsUsed: gameState.hintsUsed,
+          mistakes: gameState.mistakes,
+          mode: options.mode,
+          postLink,
+          subreddit: src.subreddit ?? '',
+          title: src.title ?? '',
+        }),
+      });
+    } catch (err) {
+      console.error('Failed to save progress', err);
+    }
+  }, [gameState.puzzle, gameState.isSolved, gameState.userMappings, gameState.elapsedTime, gameState.hintsUsed, gameState.mistakes, options.mode]);
+
   const loadNextPuzzle = useCallback(async () => {
     if (options.mode !== 'practice') return;
-    
+    await saveProgress();
     setLoading(true);
     setError(null);
     setScore(null);
     try {
-      let endpoint = '/api/puzzle/practice';
-      if (options.subreddit) {
-        endpoint += `?subreddit=${encodeURIComponent(options.subreddit)}`;
-      }
-      const res = await fetch(endpoint);
+      const params = new URLSearchParams();
+      if (options.subreddit) params.set('subreddit', options.subreddit);
+      practiceSeedRef.current += 1;
+      params.set('seed', String(practiceSeedRef.current));
+      const res = await fetch(`/api/puzzle/practice?${params.toString()}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
       const data: GetPracticePuzzleResponse = await res.json();
@@ -324,7 +383,25 @@ export const useCryptogram = (options: UseCryptogramOptions) => {
     } finally {
       setLoading(false);
     }
-  }, [options.mode, options.subreddit]);
+  }, [options.mode, options.subreddit, saveProgress]);
+
+  const loadFromHistoryEntry = useCallback((entry: PlayHistoryEntry) => {
+    if (!entry.isInProgress || !entry.savedPuzzle) return;
+    skipNextLoadRef.current = true;
+    const puzzle = entry.savedPuzzle;
+    setGameState({
+      puzzle,
+      userMappings: entry.userMappings ?? {},
+      selectedCipher: null,
+      hintsUsed: entry.hintsUsed ?? 0,
+      hintsRevealed: [],
+      isSolved: false,
+      startTime: Date.now() - (entry.elapsedTime ?? 0) * 1000,
+      elapsedTime: entry.elapsedTime ?? 0,
+      mistakes: entry.mistakes ?? 0,
+    });
+    setScore(null);
+  }, []);
 
   return {
     gameState,
@@ -340,5 +417,7 @@ export const useCryptogram = (options: UseCryptogramOptions) => {
     clearAll,
     generateShare,
     loadNextPuzzle,
+    saveProgress,
+    loadFromHistoryEntry,
   };
 };

@@ -1,21 +1,65 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, type ReactNode } from 'react';
 import { useCryptogram } from '../hooks/useCryptogram';
 import { formatTime } from '../../shared/types/puzzle';
 import { generateCipherMap } from '../../shared/cryptogram/engine';
+import type { PlayHistoryEntry, LeaderboardEntry } from '../../shared/types/api';
+import { getRedditPostUrl } from '../../shared/reddit-link';
+import { TERMS_CONTENT } from '../legal/terms-content';
+import { PRIVACY_CONTENT } from '../legal/privacy-content';
 
 type GameMode = 'daily' | 'practice';
+
+function renderLegalContent(content: string): ReactNode {
+  const lines = content.split('\n');
+  const out: ReactNode[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line == null) { i++; continue; }
+    if (line.startsWith('# ')) {
+      out.push(<h1 key={i} className="text-lg font-bold text-white mt-4 mb-2 first:mt-0">{line.slice(2)}</h1>);
+      i++;
+    } else if (line.startsWith('## ')) {
+      out.push(<h2 key={i} className="text-sm font-bold text-zinc-300 mt-3 mb-1">{line.slice(3)}</h2>);
+      i++;
+    } else if (line.startsWith('- ')) {
+      out.push(<li key={i} className="text-zinc-400 text-sm ml-4">{line.slice(2)}</li>);
+      i++;
+    } else if (line.trim() === '') {
+      i++;
+    } else {
+      out.push(<p key={i} className="text-zinc-400 text-sm mb-2">{line}</p>);
+      i++;
+    }
+  }
+  return <div className="space-y-0">{out}</div>;
+}
 
 export const App = () => {
   const [mode, setMode] = useState<GameMode>('daily');
   const [showKey, setShowKey] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [showTerms, setShowTerms] = useState(false);
+  const [showPrivacy, setShowPrivacy] = useState(false);
+  const [playHistory, setPlayHistory] = useState<PlayHistoryEntry[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [selectedSubreddit, setSelectedSubreddit] = useState<string>('');
+  const [customSubreddit, setCustomSubreddit] = useState<string>('');
+  const [appliedCustomSubreddit, setAppliedCustomSubreddit] = useState<string>('');
   const [availableSubreddits, setAvailableSubreddits] = useState<string[]>([]);
+  const [copyFeedback, setCopyFeedback] = useState(false);
+  const [gamePostUrl, setGamePostUrl] = useState<string>('');
+  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [userRank, setUserRank] = useState<number | undefined>();
+  const [totalPlayers, setTotalPlayers] = useState<number>(0);
+  const [leaderboardLoading, setLeaderboardLoading] = useState(false);
+
+  const practiceFilter = selectedSubreddit || appliedCustomSubreddit;
   
   const {
     gameState,
     loading,
     error,
-    score,
     currentScore,
     handleTileClick,
     handleLetterClick,
@@ -23,9 +67,10 @@ export const App = () => {
     removeLetterMapping,
     useHint,
     clearAll,
-    generateShare,
     loadNextPuzzle,
-  } = useCryptogram({ mode, subreddit: selectedSubreddit || undefined });
+    saveProgress,
+    loadFromHistoryEntry,
+  } = useCryptogram({ mode, ...(practiceFilter ? { subreddit: practiceFilter } : {}) });
 
   // Load available subreddits for practice mode
   useEffect(() => {
@@ -40,6 +85,36 @@ export const App = () => {
         .catch((err) => console.error('Failed to load subreddits', err));
     }
   }, [mode]);
+
+  // Load game post URL for sharing (short Reddit link to this game post)
+  useEffect(() => {
+    fetch('/api/post-url')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.postUrl) {
+          setGamePostUrl(data.postUrl);
+        }
+      })
+      .catch((err) => console.error('Failed to load post URL', err));
+  }, []);
+
+  // Fetch leaderboard when daily puzzle is solved
+  useEffect(() => {
+    if (mode === 'daily' && gameState.isSolved && gameState.puzzle?.id) {
+      setLeaderboardLoading(true);
+      fetch(`/api/leaderboard/daily?puzzleId=${encodeURIComponent(gameState.puzzle.id)}`)
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.type === 'leaderboard') {
+            setLeaderboard(data.entries || []);
+            setUserRank(data.userRank);
+            setTotalPlayers(data.totalPlayers || 0);
+          }
+        })
+        .catch((err) => console.error('Failed to load leaderboard', err))
+        .finally(() => setLeaderboardLoading(false));
+    }
+  }, [mode, gameState.isSolved, gameState.puzzle?.id]);
 
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -207,33 +282,37 @@ export const App = () => {
   // Cipher key for debug
   const cipherMap = puzzle ? generateCipherMap(puzzle.seed) : null;
 
-  // Generate Reddit link - permalink should be a relative path from Reddit API
-  const getRedditLink = (source: typeof puzzle.source) => {
-    if (!source.permalink) {
-      // Fallback: create search URL if no permalink
-      const subreddit = source.subreddit.replace('r/', '').replace('r', '');
-      const searchQuery = encodeURIComponent(source.title);
-      return `https://reddit.com/r/${subreddit}/search/?q=${searchQuery}&restrict_sr=1&sort=relevance&t=all`;
-    }
-    
-    // If it's already a full URL, use it
-    if (source.permalink.startsWith('http')) {
-      return source.permalink;
-    }
-    
-    // Reddit permalinks are relative paths like /r/subreddit/comments/postid/title/
-    // Prepend reddit.com to make it a full URL
-    if (source.permalink.startsWith('/')) {
-      return `https://reddit.com${source.permalink}`;
-    }
-    
-    // If it doesn't start with /, it might be malformed, try to construct it
-    // Format: /r/subreddit/comments/postid/title/
-    const subreddit = source.subreddit.replace('r/', '').replace('r', '');
-    return `https://reddit.com/r/${subreddit}/comments/${source.id}`;
-  };
+  const redditLink = puzzle ? getRedditPostUrl(puzzle.source) : null;
 
-  const redditLink = puzzle ? getRedditLink(puzzle.source) : null;
+  // Merge current solved puzzle into history for display; dedupe by puzzleId so daily shows once
+  const displayHistory = (() => {
+    const list = [...playHistory];
+    if (gameState.isSolved && gameState.puzzle && currentScore != null) {
+      if (!list.some((e) => e.puzzleId === gameState.puzzle!.id)) {
+        const src = gameState.puzzle.source;
+        const postLink = getRedditPostUrl(src);
+        list.unshift({
+          puzzleId: gameState.puzzle.id,
+          date: gameState.puzzle.date,
+          score: currentScore,
+          time: gameState.elapsedTime,
+          hintsUsed: gameState.hintsUsed,
+          mistakes: gameState.mistakes,
+          mode: gameState.puzzle.mode,
+          postLink,
+          subreddit: src.subreddit ?? '',
+          title: src.title ?? '',
+        });
+      }
+    }
+    const seen = new Set<string>();
+    return list.filter((e) => {
+      if (e.puzzleId.startsWith('daily-') && e.mode === 'practice') return false;
+      if (seen.has(e.puzzleId)) return false;
+      seen.add(e.puzzleId);
+      return true;
+    });
+  })();
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-zinc-950 via-zinc-900 to-zinc-950 text-white p-2 sm:p-4 overflow-x-hidden">
@@ -255,23 +334,48 @@ export const App = () => {
               {formatTime(elapsedTime)}
             </div>
           </div>
-          {mode === 'practice' && (
+          <div className="flex items-center gap-1 flex-shrink-0">
             <button
-              onClick={() => setShowKey(!showKey)}
-              className="px-2 sm:px-3 py-1 bg-zinc-800 rounded text-xs text-zinc-400 hover:bg-zinc-700 flex-shrink-0"
+              type="button"
+              onClick={async () => {
+                setShowHistory(true);
+                setHistoryLoading(true);
+                try {
+                  const res = await fetch('/api/score/history');
+                  const data = await res.json();
+                  setPlayHistory(data.history ?? []);
+                } catch (e) {
+                  setPlayHistory([]);
+                } finally {
+                  setHistoryLoading(false);
+                }
+              }}
+              className="px-2 sm:px-3 py-1 bg-zinc-800 rounded text-xs text-zinc-400 hover:bg-zinc-700"
             >
-              {showKey ? 'Hide' : 'Show'} Key
+              📊 History
             </button>
-          )}
+            {mode === 'practice' && (
+              <button
+                type="button"
+                onClick={() => setShowKey(!showKey)}
+                className="px-2 sm:px-3 py-1 bg-zinc-800 rounded text-xs text-zinc-400 hover:bg-zinc-700"
+              >
+                {showKey ? 'Hide' : 'Show'} Key
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Mode selector */}
         <div className="flex flex-col gap-2 mb-4">
           <div className="flex gap-2 flex-wrap">
             <button
-              onClick={() => {
+              onClick={async () => {
+                await saveProgress?.();
                 setMode('daily');
                 setSelectedSubreddit('');
+                setCustomSubreddit('');
+                setAppliedCustomSubreddit('');
               }}
               className={`px-3 sm:px-4 py-2 rounded-lg font-semibold text-sm sm:text-base ${
                 mode === 'daily'
@@ -282,7 +386,12 @@ export const App = () => {
               Daily
             </button>
             <button
-              onClick={() => setMode('practice')}
+              onClick={async () => {
+                await saveProgress?.();
+                setMode('practice');
+                setCustomSubreddit('');
+                setAppliedCustomSubreddit('');
+              }}
               className={`px-3 sm:px-4 py-2 rounded-lg font-semibold text-sm sm:text-base ${
                 mode === 'practice'
                   ? 'bg-orange-500 text-white'
@@ -291,6 +400,23 @@ export const App = () => {
             >
               Practice
             </button>
+            {!isSolved && gameState.puzzle && (
+              <button
+                type="button"
+                onClick={async () => {
+                  await saveProgress?.();
+                  setShowHistory(true);
+                  setHistoryLoading(false);
+                  const res = await fetch('/api/score/history');
+                  const data = await res.json().catch(() => ({ history: [] }));
+                  setPlayHistory(data.history ?? []);
+                }}
+                className="px-3 sm:px-4 py-2 rounded-lg font-semibold bg-amber-600 hover:bg-amber-500 text-white text-sm sm:text-base"
+                title="Save progress and find this puzzle in History to resume later"
+              >
+                ⏸ Pause & save
+              </button>
+            )}
             {mode === 'practice' && !isSolved && (
               <button
                 onClick={loadNextPuzzle}
@@ -301,22 +427,63 @@ export const App = () => {
             )}
           </div>
           
-          {/* Subreddit selector for practice mode */}
-          {mode === 'practice' && availableSubreddits.length > 0 && (
-            <div className="flex items-center gap-2">
-              <label className="text-sm text-zinc-400">Filter by subreddit:</label>
+          {/* Filter: Trending or by subreddit (dropdown + custom) for practice */}
+          {mode === 'practice' && (
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="text-sm text-zinc-400">Filter:</label>
               <select
                 value={selectedSubreddit}
-                onChange={(e) => setSelectedSubreddit(e.target.value)}
+                onChange={(e) => {
+                  setSelectedSubreddit(e.target.value);
+                  setCustomSubreddit('');
+                  setAppliedCustomSubreddit('');
+                }}
                 className="px-3 py-1 bg-zinc-800 text-white rounded-lg border border-zinc-700 focus:border-orange-500 focus:outline-none"
+                title="Popular = hot posts from multiple subreddits, sorted by upvotes"
               >
-                <option value="">All Subreddits</option>
+                <option value="">Popular</option>
                 {availableSubreddits.map((sub) => (
                   <option key={sub} value={sub}>
                     {sub}
                   </option>
                 ))}
               </select>
+              <span className="text-zinc-500 text-sm">or custom:</span>
+              <span className="text-zinc-400 text-sm">r/</span>
+              <input
+                type="text"
+                value={customSubreddit}
+                onChange={(e) => setCustomSubreddit(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    const name = customSubreddit.trim().replace(/^r\/?/, '');
+                    if (name) {
+                      setAppliedCustomSubreddit(`r/${name}`);
+                      setSelectedSubreddit('');
+                    }
+                  }
+                }}
+                placeholder="subreddit (Enter to apply)"
+                className="w-28 sm:w-32 px-2 py-1 bg-zinc-800 text-white rounded-lg border border-zinc-700 focus:border-orange-500 focus:outline-none text-sm placeholder-zinc-500"
+                aria-label="Custom subreddit name — press Enter to apply"
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  const name = customSubreddit.trim().replace(/^r\/?/, '');
+                  if (name) {
+                    setAppliedCustomSubreddit(`r/${name}`);
+                    setSelectedSubreddit('');
+                  }
+                }}
+                className="px-2 py-1 bg-orange-500 hover:bg-orange-400 rounded-lg text-xs font-medium text-white"
+              >
+                Go
+              </button>
+              <p className="text-zinc-500 text-xs w-full mt-0.5">
+                Popular = hot posts from several subreddits, sorted by upvotes. Type any subreddit and press Enter or Go.
+              </p>
             </div>
           )}
         </div>
@@ -349,12 +516,112 @@ export const App = () => {
           </div>
         )}
 
-        {/* Victory Modal Overlay */}
-        {isSolved && (
+        {/* Play History Modal */}
+        {showHistory && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+            <div className="bg-zinc-900 rounded-xl border border-zinc-700 max-w-lg w-full max-h-[85vh] overflow-hidden flex flex-col">
+              <div className="p-4 border-b border-zinc-700 flex justify-between items-center">
+                <h2 className="text-lg font-bold text-white">Play History</h2>
+                <button
+                  type="button"
+                  onClick={() => setShowHistory(false)}
+                  className="text-zinc-400 hover:text-white"
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="p-4 overflow-y-auto flex-1">
+                {historyLoading ? (
+                  <p className="text-zinc-400 text-sm">Loading...</p>
+                ) : displayHistory.length === 0 ? (
+                  <p className="text-zinc-400 text-sm">No puzzles yet. Solve one or pause and save to see it here!</p>
+                ) : (
+                  <>
+                    <p className="text-zinc-400 text-xs mb-3">
+                      {displayHistory.length} puzzle{displayHistory.length !== 1 ? 's' : ''} in history
+                      {displayHistory.filter((e) => e.score > 0).length > 0 && (
+                        <> · Avg score: {Math.round(displayHistory.filter((e) => e.score > 0).reduce((a, e) => a + e.score, 0) / displayHistory.filter((e) => e.score > 0).length).toLocaleString()}</>
+                      )}
+                    </p>
+                    <ul className="space-y-2">
+                      {displayHistory.map((entry, i) => (
+                        <li
+                          key={`${entry.puzzleId}-${i}`}
+                          className="bg-zinc-800/80 rounded-lg p-3 text-left border border-zinc-700"
+                        >
+                          <div className="flex justify-between items-start gap-2">
+                            <div className="min-w-0 flex-1">
+                              <span className="text-orange-400 font-semibold text-xs uppercase">{entry.mode}</span>
+                              <span className="text-zinc-500 text-xs ml-2">{entry.date}</span>
+                              {entry.isInProgress && (
+                                <span className="ml-2 text-amber-400 text-xs">In progress</span>
+                              )}
+                              <p className="text-white text-sm truncate mt-0.5" title={entry.isInProgress ? undefined : (entry.title || '')}>
+                                {entry.isInProgress ? 'Paused puzzle — resume to continue' : (entry.title || '—')}
+                              </p>
+                              <p className="text-zinc-400 text-xs mt-1">
+                                {entry.isInProgress ? (
+                                  <>Paused at {formatTime(entry.elapsedTime ?? entry.time)} · {entry.subreddit}</>
+                                ) : (
+                                  <>{entry.score.toLocaleString()} pts · {formatTime(entry.time)} · {entry.subreddit}</>
+                                )}
+                              </p>
+                            </div>
+                            <div className="flex flex-shrink-0 gap-1">
+                              {entry.isInProgress && entry.savedPuzzle ? (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    loadFromHistoryEntry(entry);
+                                    setMode(entry.savedPuzzle!.mode);
+                                    if (entry.savedPuzzle!.mode === 'practice' && entry.subreddit) {
+                                      setSelectedSubreddit(entry.subreddit);
+                                      setCustomSubreddit('');
+                                      setAppliedCustomSubreddit('');
+                                    } else {
+                                      setSelectedSubreddit('');
+                                      setCustomSubreddit('');
+                                      setAppliedCustomSubreddit('');
+                                    }
+                                    setShowHistory(false);
+                                  }}
+                                  className="px-2 py-1 bg-emerald-600 hover:bg-emerald-500 rounded text-xs font-medium"
+                                >
+                                  Resume
+                                </button>
+                              ) : null}
+                              {(() => {
+                                const entryUrl = entry.postLink || (entry.savedPuzzle ? getRedditPostUrl(entry.savedPuzzle.source) : '') || (entry.subreddit ? `https://www.reddit.com/r/${(entry.subreddit || '').replace(/^r\//, '').trim()}` : '');
+                                return entryUrl ? (
+                                  <a
+                                    href={entryUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className={`px-2 py-1 rounded text-xs font-medium text-white inline-block ${entry.isInProgress ? 'bg-zinc-600 hover:bg-zinc-500' : 'bg-orange-500 hover:bg-orange-400'}`}
+                                  >
+                                    View Post
+                                  </a>
+                                ) : null;
+                              })()}
+                            </div>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Victory Modal Overlay - daily and practice */}
+        {isSolved && puzzle && (
           <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
             <div className="bg-gradient-to-r from-emerald-900/30 to-blue-900/30 rounded-xl p-4 sm:p-6 md:p-8 border border-emerald-500/50 text-center max-w-md w-full mx-4 max-h-[90vh] overflow-y-auto">
               <div className="text-4xl sm:text-5xl mb-2">🎉</div>
               <h2 className="text-xl sm:text-2xl font-black text-emerald-400 mb-2">SOLVED!</h2>
+              <p className="text-sm text-zinc-400 mb-1">{mode === 'practice' ? 'Congratulations! You solved the puzzle.' : 'Congratulations! You solved today\'s puzzle.'}</p>
               <p className="text-sm sm:text-base text-zinc-300 italic mb-4 break-words">"{puzzle.plainText}"</p>
               
               {/* Stats Grid */}
@@ -380,40 +647,127 @@ export const App = () => {
                   </div>
                 )}
               </div>
+
+              {/* Daily Leaderboard */}
+              {mode === 'daily' && (
+                <div className="mt-4 mb-2">
+                  <h3 className="text-sm font-bold text-zinc-400 mb-2 flex items-center justify-center gap-2">
+                    <span>🏆</span> TODAY'S LEADERBOARD
+                    {userRank && totalPlayers > 0 && (
+                      <span className="text-emerald-400 font-normal">
+                        (You: #{userRank} of {totalPlayers})
+                      </span>
+                    )}
+                  </h3>
+                  {leaderboardLoading ? (
+                    <div className="text-zinc-500 text-sm py-2">Loading...</div>
+                  ) : leaderboard.length > 0 ? (
+                    <div className="bg-zinc-800/50 rounded-lg overflow-hidden">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="text-zinc-500 text-xs border-b border-zinc-700">
+                            <th className="py-1 px-2 text-left">#</th>
+                            <th className="py-1 px-2 text-left">Player</th>
+                            <th className="py-1 px-2 text-right">Score</th>
+                            <th className="py-1 px-2 text-right">Time</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {leaderboard.map((entry) => (
+                            <tr 
+                              key={entry.rank} 
+                              className={`border-b border-zinc-700/50 last:border-0 ${
+                                entry.rank === userRank ? 'bg-emerald-900/30' : ''
+                              }`}
+                            >
+                              <td className="py-1.5 px-2 text-left">
+                                {entry.rank === 1 ? '🥇' : entry.rank === 2 ? '🥈' : entry.rank === 3 ? '🥉' : entry.rank}
+                              </td>
+                              <td className="py-1.5 px-2 text-left truncate max-w-[100px]">
+                                {entry.username}
+                              </td>
+                              <td className="py-1.5 px-2 text-right font-mono">
+                                {entry.score.toLocaleString()}
+                              </td>
+                              <td className="py-1.5 px-2 text-right font-mono text-zinc-400">
+                                {formatTime(entry.time)}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="text-zinc-500 text-sm py-2">Be the first to set a score!</div>
+                  )}
+                </div>
+              )}
               
-              {/* Action Buttons */}
+              {/* Action Buttons: View Original Post, Share to Reddit, Copy, Continue / Next */}
               <div className="flex flex-col gap-2 mt-4">
-                {mode === 'daily' && (
-                  <button
-                    onClick={async () => {
-                      const shareText = await generateShare();
-                      if (shareText) {
-                        await navigator.clipboard.writeText(shareText);
-                        alert('Share text copied to clipboard!');
-                      }
-                    }}
-                    className="px-4 sm:px-6 py-2 bg-blue-500 hover:bg-blue-400 rounded-lg font-bold text-sm sm:text-base"
-                  >
-                    📋 Copy Share Text
-                  </button>
-                )}
-                {mode === 'practice' && (
-                  <button
-                    onClick={loadNextPuzzle}
-                    className="px-4 sm:px-6 py-2 bg-green-500 hover:bg-green-400 rounded-lg font-bold text-sm sm:text-base"
-                  >
-                    ➡️ Next Puzzle
-                  </button>
-                )}
                 {redditLink && (
                   <a
                     href={redditLink}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="px-4 sm:px-6 py-2 bg-orange-500 hover:bg-orange-400 rounded-lg font-bold text-center block text-sm sm:text-base"
+                    className="w-full px-4 sm:px-6 py-2 bg-orange-500 hover:bg-orange-400 rounded-lg font-bold text-sm sm:text-base text-white text-center block"
                   >
-                    View Original Post →
+                    🔗 View Original Post
                   </a>
+                )}
+                {mode === 'daily' && (
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        // Copy score text with game link - for sharing anywhere
+                        const text = `I scored ${currentScore.toLocaleString()} in ${formatTime(elapsedTime)} with ${hintsUsed} hint${hintsUsed !== 1 ? 's' : ''} on PostCipher!${gamePostUrl ? `\n\nPlay: ${gamePostUrl}` : ''}`;
+                        try {
+                          await navigator.clipboard.writeText(text);
+                          setCopyFeedback(true);
+                          setTimeout(() => setCopyFeedback(false), 2500);
+                        } catch {
+                          alert(`Copy this to share:\n\n${text}`);
+                        }
+                      }}
+                      className={`flex-1 px-4 sm:px-6 py-2 rounded-lg font-bold text-sm sm:text-base ${
+                        copyFeedback ? 'bg-green-500' : 'bg-zinc-600 hover:bg-zinc-500'
+                      }`}
+                    >
+                      {copyFeedback ? '✓ Copied!' : '📋 Copy Score'}
+                    </button>
+                    <a
+                      href={`https://www.reddit.com/r/PostCipher/submit?title=${encodeURIComponent(`PostCipher - Score: ${currentScore.toLocaleString()} | Time: ${formatTime(elapsedTime)} | Hints: ${hintsUsed}`)}&text=${encodeURIComponent(`I just solved today's PostCipher puzzle!\n\n🏆 Score: ${currentScore.toLocaleString()}\n⏱️ Time: ${formatTime(elapsedTime)}\n💡 Hints used: ${hintsUsed}\n\nCan you beat my score? Play the daily puzzle: ${gamePostUrl || 'https://www.reddit.com/r/PostCipher'}`)}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex-1 px-4 sm:px-6 py-2 rounded-lg font-bold text-sm sm:text-base bg-blue-500 hover:bg-blue-400 text-center"
+                    >
+                      📤 Share to Reddit
+                    </a>
+                  </div>
+                )}
+                {mode === 'daily' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMode('practice');
+                      setSelectedSubreddit('');
+                      setCustomSubreddit('');
+                      setAppliedCustomSubreddit('');
+                    }}
+                    className="px-4 sm:px-6 py-2 bg-green-500 hover:bg-green-400 rounded-lg font-bold text-sm sm:text-base"
+                  >
+                    🎮 Continue in Practice Mode
+                  </button>
+                )}
+                {mode === 'practice' && (
+                  <button
+                    type="button"
+                    onClick={loadNextPuzzle}
+                    className="px-4 sm:px-6 py-2 bg-green-500 hover:bg-green-400 rounded-lg font-bold text-sm sm:text-base"
+                  >
+                    ➡️ Next Puzzle
+                  </button>
                 )}
               </div>
             </div>
@@ -555,7 +909,56 @@ export const App = () => {
             ))}
           </div>
         )}
+
+        {/* Footer: Terms & Privacy */}
+        <footer className="mt-6 pt-4 pb-2 border-t border-zinc-800 text-center text-xs text-zinc-500">
+          <button
+            type="button"
+            onClick={() => setShowTerms(true)}
+            className="hover:text-zinc-300 underline"
+          >
+            Terms of Service
+          </button>
+          {' · '}
+          <button
+            type="button"
+            onClick={() => setShowPrivacy(true)}
+            className="hover:text-zinc-300 underline"
+          >
+            Privacy Policy
+          </button>
+        </footer>
       </div>
+
+      {/* Terms of Service modal */}
+      {showTerms && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="bg-zinc-900 rounded-xl border border-zinc-700 max-w-lg w-full max-h-[85vh] overflow-hidden flex flex-col">
+            <div className="p-4 border-b border-zinc-700 flex justify-between items-center">
+              <h2 className="text-lg font-bold text-white">Terms of Service</h2>
+              <button type="button" onClick={() => setShowTerms(false)} className="text-zinc-400 hover:text-white">✕</button>
+            </div>
+            <div className="p-4 overflow-y-auto flex-1 text-left">
+              {renderLegalContent(TERMS_CONTENT)}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Privacy Policy modal */}
+      {showPrivacy && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="bg-zinc-900 rounded-xl border border-zinc-700 max-w-lg w-full max-h-[85vh] overflow-hidden flex flex-col">
+            <div className="p-4 border-b border-zinc-700 flex justify-between items-center">
+              <h2 className="text-lg font-bold text-white">Privacy Policy</h2>
+              <button type="button" onClick={() => setShowPrivacy(false)} className="text-zinc-400 hover:text-white">✕</button>
+            </div>
+            <div className="p-4 overflow-y-auto flex-1 text-left">
+              {renderLegalContent(PRIVACY_CONTENT)}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

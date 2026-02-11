@@ -24,6 +24,9 @@
     "http": {
       "enable": true,
       "domains": ["reddit.com", "www.reddit.com", "old.reddit.com"]
+    },
+    "reddit": {
+      "asUser": ["SUBMIT_POST", "SUBMIT_COMMENT"]
     }
   },
   "menu": {
