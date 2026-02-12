@@ -9,14 +9,20 @@ const REDDIT_BASE = 'https://www.reddit.com';
 
 /**
  * Build the full Reddit post URL for "View post" / "View Original Post".
- * Uses permalink when present (if it points to a specific post), otherwise builds from subreddit + id.
+ * Priority: 
+ * 1. Use permalink if it contains /comments/ (direct post link)
+ * 2. Build from id + subreddit if we have a real Reddit post ID
+ * 3. Fall back to subreddit link for curated posts
  */
 export function getRedditPostUrl(source: RedditPostSource | null | undefined): string {
   if (!source) return '';
+  
   const sub = (source.subreddit ?? '')
     .replace(/^r\//, '')
     .replace(/^r/, '')
     .trim() || 'reddit';
+  
+  const id = (source.id ?? '').trim();
   const raw = (source.permalink ?? '').trim();
   
   // Check if permalink points to a specific post (contains /comments/)
@@ -25,12 +31,14 @@ export function getRedditPostUrl(source: RedditPostSource | null | undefined): s
     return `${REDDIT_BASE}${raw.startsWith('/') ? raw : `/${raw}`}`;
   }
   
-  // If we have an ID that looks like a real Reddit post ID, build a proper link
-  const id = source.id ?? '';
-  if (id && !id.startsWith('curated-') && !id.startsWith('post-')) {
-    return `${REDDIT_BASE}/r/${sub}/comments/${id}`;
+  // If we have an ID that looks like a real Reddit post ID, always build a proper link
+  // This handles cases where permalink was saved incorrectly as just a subreddit URL
+  if (id && !id.startsWith('curated-') && !id.startsWith('post-') && !id.startsWith('practice-')) {
+    // Strip t3_ prefix if present
+    const cleanId = id.replace(/^t3_/, '');
+    return `${REDDIT_BASE}/r/${sub}/comments/${cleanId}`;
   }
   
-  // For curated posts without real IDs, link to the subreddit
+  // For curated/practice posts without real IDs, link to the subreddit
   return `${REDDIT_BASE}/r/${sub}`;
 }

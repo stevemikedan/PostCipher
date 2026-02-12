@@ -38,9 +38,13 @@ function devvitPostToRedditPost(p: DevvitPostLike): RedditPost {
   const id = p.id.replace(/^t3_/, '');
   const subreddit = p.subredditName?.startsWith('r/') ? p.subredditName : `r/${p.subredditName || 'unknown'}`;
   const rawPermalink = p.permalink && String(p.permalink).trim();
-  const permalink = rawPermalink
+  
+  // Only use the permalink if it looks like an actual post link (contains /comments/)
+  // Otherwise build from id + subreddit to ensure we always have a valid post URL
+  const permalink = (rawPermalink && rawPermalink.includes('/comments/'))
     ? (rawPermalink.startsWith('/') ? rawPermalink : `/${rawPermalink}`)
     : buildPermalink(id, subreddit);
+    
   const author = p.authorName?.startsWith('u/') ? p.authorName : `u/${p.authorName || 'unknown'}`;
   const createdUtc =
     p.createdAt instanceof Date ? p.createdAt.getTime() / 1000 : Number(p.createdAt) / 1000 || Date.now() / 1000;
@@ -354,40 +358,22 @@ export async function fetchRandomPost(subreddit?: string): Promise<RedditPost | 
   }
 
   try {
-    let posts: RedditPost[] = subreddit
+    const posts: RedditPost[] = subreddit
       ? await fetchPostsForSubreddit(subreddit, 50, 'hot')
       : await fetchTrendingPosts(30);
 
     if (posts.length === 0) {
       console.log(`No Reddit posts found${subreddit ? ` for ${subreddit}` : ''}, falling back to curated library`);
-      const { getRandomCuratedQuote } = await import('./puzzle-library');
-      let fallbackPost = getRandomCuratedQuote();
-      if (subreddit) {
-        const normalizedSubreddit = subreddit.toLowerCase().replace(/^r\//, '');
-        const { CURATED_QUOTES } = await import('./puzzle-library');
-        const matchingQuotes = CURATED_QUOTES.filter(
-          (q) => q.subreddit.toLowerCase().replace(/^r\//, '') === normalizedSubreddit
-        );
-        if (matchingQuotes.length > 0) {
-          const timestampSeed = Math.floor(Date.now() / 1000);
-          const seedHash = hashString(`curated-${timestampSeed}-${normalizedSubreddit}`);
-          const randomQuote = matchingQuotes[seedHash % matchingQuotes.length];
-          fallbackPost = {
-            ...randomQuote,
-            id: `curated-${Date.now()}-${Math.random()}`,
-            permalink: `https://reddit.com/${randomQuote.subreddit}`,
-            createdUtc: Date.now() / 1000,
-          };
-        }
-      }
-      return fallbackPost;
+      const { getRandomCuratedPost } = await import('./puzzle-library');
+      return getRandomCuratedPost();
     }
 
     // Only use cipher-friendly posts (no digits, mostly letters) so the puzzle isn't full of unencodable characters
     const cipherFriendlyPool = filterCipherFriendly(posts);
     if (cipherFriendlyPool.length === 0) {
-      console.log(`No cipher-friendly posts in fetch (${posts.length} total), returning null for library fallback`);
-      return null;
+      console.log(`No cipher-friendly posts in fetch (${posts.length} total), falling back to curated library`);
+      const { getRandomCuratedPost } = await import('./puzzle-library');
+      return getRandomCuratedPost();
     }
 
     const timestampSeed = Math.floor(Date.now() / 1000);
@@ -396,9 +382,9 @@ export async function fetchRandomPost(subreddit?: string): Promise<RedditPost | 
     console.log(`Selected cipher-friendly post from ${cipherFriendlyPool.length} (${selectedPost.subreddit}): "${selectedPost.title.substring(0, 50)}..."`);
     return selectedPost;
   } catch (error) {
-    console.error('Error fetching random post:', error);
-    const { getRandomCuratedQuote } = await import('./puzzle-library');
-    return getRandomCuratedQuote();
+    console.error('Error fetching random post, falling back to curated library:', error);
+    const { getRandomCuratedPost } = await import('./puzzle-library');
+    return getRandomCuratedPost();
   }
 }
 

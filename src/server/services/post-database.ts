@@ -1,9 +1,10 @@
 // Post database system for deterministic daily puzzle selection
+// Uses real Reddit posts - curated fallback library + posts pulled via Devvit API
 
 import { redis } from '@devvit/web/server';
 import { getDifficulty, isCipherFriendly } from '../../shared/cryptogram/cipher-fit';
 import type { RedditPost } from '../../shared/types/puzzle';
-import { CURATED_QUOTES } from './puzzle-library';
+import { getAllCuratedPosts } from './puzzle-library';
 
 /** Whether a post is a good fit for substitution cipher (stored or computed from title) */
 function postIsCipherFriendly(post: RedditPost): boolean {
@@ -18,9 +19,8 @@ const DAILY_USED_POSTS_KEY = 'postcipher:daily:used';
 export const MAX_DB_SIZE = 10000;
 
 /**
- * Initialize the post database in Redis
- * This should be called once to seed the database
- * Must be called within a request context (lazy initialization)
+ * Initialize the post database in Redis with curated real posts
+ * These are actual Reddit posts with valid IDs and permalinks
  */
 export async function initializePostDatabase(): Promise<void> {
   try {
@@ -30,28 +30,20 @@ export async function initializePostDatabase(): Promise<void> {
       return;
     }
 
-    // Store all posts in Redis (with cipher-fit attributes for selection)
-    const posts: RedditPost[] = CURATED_QUOTES.map((quote, index) => {
-      const title = quote.title;
-      const id = `curated-${index}`;
-      const sub = (quote.subreddit || 'r/reddit').replace(/^r\//, '');
-      return {
-        ...quote,
-        id,
-        // For curated quotes, use the subreddit link since these aren't real posts
-        // Real posts from Reddit API will have proper permalinks
-        permalink: `/r/${sub}`,
-        createdUtc: Date.now() / 1000 - (CURATED_QUOTES.length - index) * 86400,
-        cipherFriendly: isCipherFriendly(title),
-        difficulty: getDifficulty(title),
-      };
-    });
+    // Seed with curated real Reddit posts
+    const curatedPosts = getAllCuratedPosts();
+    
+    // Ensure all posts have cipher-friendly and difficulty attributes
+    const posts: RedditPost[] = curatedPosts.map((post) => ({
+      ...post,
+      cipherFriendly: post.cipherFriendly ?? isCipherFriendly(post.title),
+      difficulty: post.difficulty ?? getDifficulty(post.title),
+    }));
 
-    // Store posts as JSON array
     await redis.set(POST_DB_KEY, JSON.stringify(posts));
     await redis.set(POST_COUNT_KEY, posts.length.toString());
 
-    console.log(`Initialized post database with ${posts.length} posts`);
+    console.log(`Initialized post database with ${posts.length} curated real posts`);
   } catch (error) {
     // If no context, initialization will happen on first request
     if (error instanceof Error && error.message.includes('No context')) {
@@ -76,7 +68,11 @@ export async function addPostToDatabase(post: RedditPost): Promise<void> {
 }
 
 /**
- * Build a proper permalink for a post if it doesn't have one
+ * Build a proper permalink for a post if it doesn't have one.
+ * Priority:
+ * 1. Keep existing permalink if it contains /comments/
+ * 2. Build from id + subreddit for real Reddit posts
+ * 3. Fall back to subreddit link for curated posts
  */
 function ensureValidPermalink(post: RedditPost): string {
   const raw = (post.permalink ?? '').trim();
@@ -84,12 +80,16 @@ function ensureValidPermalink(post: RedditPost): string {
   if (raw.includes('/comments/')) {
     return raw.startsWith('/') ? raw : `/${raw}`;
   }
+  
   // If we have a real Reddit post ID, build the permalink
-  const id = post.id ?? '';
-  if (id && !id.startsWith('curated-') && !id.startsWith('post-')) {
+  const id = (post.id ?? '').trim();
+  if (id && !id.startsWith('curated-') && !id.startsWith('post-') && !id.startsWith('practice-')) {
     const sub = (post.subreddit || 'r/reddit').replace(/^r\//, '');
-    return `/r/${sub}/comments/${id}`;
+    // Strip t3_ prefix if present
+    const cleanId = id.replace(/^t3_/, '');
+    return `/r/${sub}/comments/${cleanId}`;
   }
+  
   // For curated posts, just link to the subreddit
   const sub = (post.subreddit || 'r/reddit').replace(/^r\//, '');
   return `/r/${sub}`;
@@ -202,7 +202,7 @@ async function markPostAsUsedForDaily(postId: string): Promise<void> {
  * Reset used posts tracking (e.g. after ~1 year or when running low on unused posts)
  */
 export async function resetUsedDailyPosts(): Promise<void> {
-  await redis.delete(DAILY_USED_POSTS_KEY);
+  await redis.del(DAILY_USED_POSTS_KEY);
   console.log('Reset daily puzzle used posts tracking');
 }
 
@@ -228,7 +228,9 @@ export async function getPostCount(): Promise<number> {
   await initializePostDatabase();
   
   const count = await redis.get(POST_COUNT_KEY);
-  return count ? parseInt(count, 10) : CURATED_QUOTES.length;
+  if (count) return parseInt(count, 10);
+  // Fallback to curated posts count if Redis not initialized
+  return getAllCuratedPosts().length;
 }
 
 /**

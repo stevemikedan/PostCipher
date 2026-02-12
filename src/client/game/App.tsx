@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, type ReactNode } from 'react';
+import { navigateTo } from '@devvit/web/client';
 import { useCryptogram } from '../hooks/useCryptogram';
 import { formatTime } from '../../shared/types/puzzle';
 import { generateCipherMap } from '../../shared/cryptogram/engine';
@@ -48,11 +49,11 @@ export const App = () => {
   const [appliedCustomSubreddit, setAppliedCustomSubreddit] = useState<string>('');
   const [availableSubreddits, setAvailableSubreddits] = useState<string[]>([]);
   const [copyFeedback, setCopyFeedback] = useState(false);
-  const [gamePostUrl, setGamePostUrl] = useState<string>('');
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
   const [userRank, setUserRank] = useState<number | undefined>();
   const [totalPlayers, setTotalPlayers] = useState<number>(0);
   const [leaderboardLoading, setLeaderboardLoading] = useState(false);
+  const [confirmDialog, setConfirmDialog] = useState<{ message: string; onConfirm: () => void } | null>(null);
 
   const practiceFilter = selectedSubreddit || appliedCustomSubreddit;
   
@@ -87,16 +88,6 @@ export const App = () => {
   }, [mode]);
 
   // Load game post URL for sharing (short Reddit link to this game post)
-  useEffect(() => {
-    fetch('/api/post-url')
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.postUrl) {
-          setGamePostUrl(data.postUrl);
-        }
-      })
-      .catch((err) => console.error('Failed to load post URL', err));
-  }, []);
 
   // Fetch leaderboard when daily puzzle is solved
   useEffect(() => {
@@ -522,13 +513,39 @@ export const App = () => {
             <div className="bg-zinc-900 rounded-xl border border-zinc-700 max-w-lg w-full max-h-[85vh] overflow-hidden flex flex-col">
               <div className="p-4 border-b border-zinc-700 flex justify-between items-center">
                 <h2 className="text-lg font-bold text-white">Play History</h2>
-                <button
-                  type="button"
-                  onClick={() => setShowHistory(false)}
-                  className="text-zinc-400 hover:text-white"
-                >
-                  ✕
-                </button>
+                <div className="flex items-center gap-2">
+                  {displayHistory.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setConfirmDialog({
+                          message: 'Clear all play history? This cannot be undone.',
+                          onConfirm: async () => {
+                            try {
+                              const res = await fetch('/api/history/clear', { method: 'POST' });
+                              if (res.ok) {
+                                setPlayHistory([]);
+                              }
+                            } catch (err) {
+                              console.error('Failed to clear history:', err);
+                            }
+                            setConfirmDialog(null);
+                          },
+                        });
+                      }}
+                      className="text-xs px-2 py-1 bg-zinc-700 hover:bg-red-600 rounded text-zinc-400 hover:text-white"
+                    >
+                      Clear All
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setShowHistory(false)}
+                    className="text-zinc-400 hover:text-white"
+                  >
+                    ✕
+                  </button>
+                </div>
               </div>
               <div className="p-4 overflow-y-auto flex-1">
                 {historyLoading ? (
@@ -590,19 +607,54 @@ export const App = () => {
                                   Resume
                                 </button>
                               ) : null}
-                              {(() => {
-                                const entryUrl = entry.postLink || (entry.savedPuzzle ? getRedditPostUrl(entry.savedPuzzle.source) : '') || (entry.subreddit ? `https://www.reddit.com/r/${(entry.subreddit || '').replace(/^r\//, '').trim()}` : '');
+                              {/* Only show View Post for solved puzzles (not in-progress) to prevent spoilers */}
+                              {/* Only show if we have valid source data - postLink must contain /comments/ to be a real post link */}
+                              {!entry.isInProgress && (() => {
+                                // Use savedPuzzle source if available, otherwise check if postLink is a valid post URL
+                                const entryUrl = entry.savedPuzzle 
+                                  ? getRedditPostUrl(entry.savedPuzzle.source)
+                                  : (entry.postLink && entry.postLink.includes('/comments/')) 
+                                    ? entry.postLink 
+                                    : null;
                                 return entryUrl ? (
-                                  <a
-                                    href={entryUrl}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className={`px-2 py-1 rounded text-xs font-medium text-white inline-block ${entry.isInProgress ? 'bg-zinc-600 hover:bg-zinc-500' : 'bg-orange-500 hover:bg-orange-400'}`}
+                                  <button
+                                    type="button"
+                                    onClick={() => navigateTo(entryUrl)}
+                                    className="px-2 py-1 rounded text-xs font-medium text-white bg-orange-500 hover:bg-orange-400"
                                   >
                                     View Post
-                                  </a>
+                                  </button>
                                 ) : null;
                               })()}
+                              {/* Delete single entry button */}
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const puzzleIdToDelete = entry.puzzleId;
+                                  setConfirmDialog({
+                                    message: 'Remove this entry from history?',
+                                    onConfirm: async () => {
+                                      try {
+                                        const res = await fetch('/api/history/delete', {
+                                          method: 'POST',
+                                          headers: { 'Content-Type': 'application/json' },
+                                          body: JSON.stringify({ puzzleId: puzzleIdToDelete }),
+                                        });
+                                        if (res.ok) {
+                                          setPlayHistory((prev) => prev.filter((e) => e.puzzleId !== puzzleIdToDelete));
+                                        }
+                                      } catch (err) {
+                                        console.error('Failed to delete history entry:', err);
+                                      }
+                                      setConfirmDialog(null);
+                                    },
+                                  });
+                                }}
+                                className="px-2 py-1 bg-zinc-700 hover:bg-red-600 rounded text-xs font-medium text-zinc-400 hover:text-white"
+                                title="Remove from history"
+                              >
+                                ✕
+                              </button>
                             </div>
                           </div>
                         </li>
@@ -706,14 +758,13 @@ export const App = () => {
               {/* Action Buttons: View Original Post, Share to Reddit, Copy, Continue / Next */}
               <div className="flex flex-col gap-2 mt-4">
                 {redditLink && (
-                  <a
-                    href={redditLink}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="w-full px-4 sm:px-6 py-2 bg-orange-500 hover:bg-orange-400 rounded-lg font-bold text-sm sm:text-base text-white text-center block"
+                  <button
+                    type="button"
+                    onClick={() => navigateTo(redditLink)}
+                    className="w-full px-4 sm:px-6 py-2 bg-orange-500 hover:bg-orange-400 rounded-lg font-bold text-sm sm:text-base text-white text-center"
                   >
                     🔗 View Original Post
-                  </a>
+                  </button>
                 )}
                 {mode === 'daily' && (
                   <div className="flex gap-2">
@@ -721,7 +772,7 @@ export const App = () => {
                       type="button"
                       onClick={async () => {
                         // Copy score text with game link - for sharing anywhere
-                        const text = `I scored ${currentScore.toLocaleString()} in ${formatTime(elapsedTime)} with ${hintsUsed} hint${hintsUsed !== 1 ? 's' : ''} on PostCipher!${gamePostUrl ? `\n\nPlay: ${gamePostUrl}` : ''}`;
+                        const text = `I scored ${currentScore.toLocaleString()} in ${formatTime(elapsedTime)} with ${hintsUsed} hint${hintsUsed !== 1 ? 's' : ''} on PostCipher!\n\nPlay: https://www.reddit.com/r/PostCipher/`;
                         try {
                           await navigator.clipboard.writeText(text);
                           setCopyFeedback(true);
@@ -736,14 +787,13 @@ export const App = () => {
                     >
                       {copyFeedback ? '✓ Copied!' : '📋 Copy Score'}
                     </button>
-                    <a
-                      href={`https://www.reddit.com/r/PostCipher/submit?title=${encodeURIComponent(`PostCipher - Score: ${currentScore.toLocaleString()} | Time: ${formatTime(elapsedTime)} | Hints: ${hintsUsed}`)}&text=${encodeURIComponent(`I just solved today's PostCipher puzzle!\n\n🏆 Score: ${currentScore.toLocaleString()}\n⏱️ Time: ${formatTime(elapsedTime)}\n💡 Hints used: ${hintsUsed}\n\nCan you beat my score? Play the daily puzzle: ${gamePostUrl || 'https://www.reddit.com/r/PostCipher'}`)}`}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <button
+                      type="button"
+                      onClick={() => navigateTo(`https://www.reddit.com/r/PostCipher/submit?title=${encodeURIComponent(`PostCipher - Score: ${currentScore.toLocaleString()} | Time: ${formatTime(elapsedTime)} | Hints: ${hintsUsed}`)}&text=${encodeURIComponent(`I just solved today's PostCipher puzzle!\n\n🏆 Score: ${currentScore.toLocaleString()}\n⏱️ Time: ${formatTime(elapsedTime)}\n💡 Hints used: ${hintsUsed}\n\nCan you beat my score? Play the daily puzzle: https://www.reddit.com/r/PostCipher/`)}`)}
                       className="flex-1 px-4 sm:px-6 py-2 rounded-lg font-bold text-sm sm:text-base bg-blue-500 hover:bg-blue-400 text-center"
                     >
                       📤 Share to Reddit
-                    </a>
+                    </button>
                   </div>
                 )}
                 {mode === 'daily' && (
@@ -955,6 +1005,31 @@ export const App = () => {
             </div>
             <div className="p-4 overflow-y-auto flex-1 text-left">
               {renderLegalContent(PRIVACY_CONTENT)}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Custom Confirmation Dialog (since confirm() is blocked in sandboxed iframe) */}
+      {confirmDialog && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="bg-zinc-900 rounded-xl border border-zinc-700 max-w-sm w-full p-6 text-center">
+            <p className="text-white text-sm mb-6">{confirmDialog.message}</p>
+            <div className="flex gap-3 justify-center">
+              <button
+                type="button"
+                onClick={() => setConfirmDialog(null)}
+                className="px-4 py-2 bg-zinc-700 hover:bg-zinc-600 rounded-lg text-sm font-medium"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={confirmDialog.onConfirm}
+                className="px-4 py-2 bg-red-600 hover:bg-red-500 rounded-lg text-sm font-medium"
+              >
+                Confirm
+              </button>
             </div>
           </div>
         </div>

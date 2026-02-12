@@ -88,7 +88,7 @@ export async function getDailyPuzzle(date: Date = new Date()): Promise<Puzzle> {
   if (dateChanged && lastDate) {
     console.log(`Date changed from ${lastDate} to ${dateString} - clearing old cache`);
     try {
-      await redis.delete(`${PUZZLE_CACHE_PREFIX}${lastDate}`);
+      await redis.del(`${PUZZLE_CACHE_PREFIX}${lastDate}`);
     } catch (err) {
       // Ignore if key doesn't exist
     }
@@ -215,10 +215,13 @@ export async function getPracticePuzzle(
           await syncRedditPostsToLibrary([source]);
           console.log(`Using Reddit post from ${source.subreddit}`);
         } else {
-          throw new Error('No Reddit post found');
+          // Try library as last resort
+          source = await getRandomPost(undefined, seedForSelection);
+          console.log(`Using database post from ${source.subreddit}`);
         }
       } catch (error) {
-        console.error('Error fetching from Reddit, using database:', error);
+        console.error('Error fetching from Reddit, trying database:', error);
+        // This will throw if library is empty - that's the expected behavior
         source = await getRandomPost(undefined, seedForSelection);
         console.log(`Using database post from ${source.subreddit}`);
       }

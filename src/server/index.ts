@@ -147,35 +147,6 @@ router.post('/internal/menu/post-create', async (_req, res): Promise<void> => {
 
 // ===== Post URL Endpoint =====
 
-/**
- * Get the current post's Reddit URL (short, clean link to the game post).
- * Used for sharing so users get a proper Reddit link, not the long webview URL.
- */
-router.get<unknown, { postUrl: string } | ErrorResponse>(
-  '/api/post-url',
-  async (_req, res): Promise<void> => {
-    try {
-      const { postId, subredditName } = context;
-      if (!postId || !subredditName) {
-        res.status(400).json({
-          status: 'error',
-          message: 'Post context not available',
-        });
-        return;
-      }
-      const cleanPostId = postId.replace(/^t3_/, '');
-      const postUrl = `https://www.reddit.com/r/${subredditName}/comments/${cleanPostId}`;
-      res.json({ postUrl });
-    } catch (error) {
-      console.error('Error getting post URL:', error);
-      res.status(500).json({
-        status: 'error',
-        message: error instanceof Error ? error.message : 'Failed to get post URL',
-      });
-    }
-  }
-);
-
 // ===== Admin Endpoints =====
 
 /**
@@ -188,8 +159,8 @@ router.post<unknown, { status: string; message: string }>(
     try {
       const dateString = new Date().toISOString().split('T')[0];
       const cacheKey = `puzzle:daily:${dateString}`;
-      await redis.delete(cacheKey);
-      await redis.delete('puzzle:daily:cached');
+      await redis.del(cacheKey);
+      await redis.del('puzzle:daily:cached');
       console.log(`Cleared daily puzzle cache for ${dateString}`);
       res.json({ status: 'success', message: `Cleared daily puzzle cache for ${dateString}` });
     } catch (error) {
@@ -223,6 +194,55 @@ router.post<unknown, { status: string; message: string; fixedCount: number }>(
         status: 'error',
         message: error instanceof Error ? error.message : 'Failed to repair library',
         fixedCount: 0,
+      });
+    }
+  }
+);
+
+/**
+ * Export library posts in TypeScript format for curated library
+ * Call this to get posts ready to paste into puzzle-library.ts
+ */
+router.get<unknown, { posts: string; count: number }>(
+  '/api/admin/export-library',
+  async (_req, res): Promise<void> => {
+    try {
+      const { getAllPosts } = await import('./services/post-database');
+      const allPosts = await getAllPosts();
+      
+      // Filter for cipher-friendly posts and format as TypeScript
+      const cipherFriendly = allPosts.filter(p => 
+        p.cipherFriendly && 
+        p.permalink?.includes('/comments/') &&
+        !p.id.startsWith('curated-')
+      );
+      
+      // Sort by upvotes and take top 50
+      const topPosts = cipherFriendly
+        .sort((a, b) => b.upvotes - a.upvotes)
+        .slice(0, 50);
+      
+      const formatted = topPosts.map(p => `  {
+    id: '${p.id}',
+    title: '${p.title.replace(/'/g, "\\'")}',
+    subreddit: '${p.subreddit}',
+    author: '${p.author}',
+    upvotes: ${p.upvotes},
+    permalink: '${p.permalink}',
+    createdUtc: ${Math.floor(p.createdUtc)},
+    cipherFriendly: true,
+    difficulty: '${p.difficulty || 'medium'}',
+  }`).join(',\n');
+      
+      const tsCode = `export const CURATED_POSTS: RedditPost[] = [\n${formatted}\n];`;
+      
+      console.log(`Exported ${topPosts.length} posts for curated library`);
+      res.json({ posts: tsCode, count: topPosts.length });
+    } catch (error) {
+      console.error('Error exporting library:', error);
+      res.status(500).json({
+        posts: '',
+        count: 0,
       });
     }
   }
@@ -676,6 +696,58 @@ router.get<unknown, GetScoreHistoryResponse | ErrorResponse>(
       res.status(500).json({
         status: 'error',
         message: error instanceof Error ? error.message : 'Failed to get history',
+      });
+    }
+  }
+);
+
+/**
+ * Clear all play history for the current user
+ */
+router.post<unknown, { status: string; message: string }>(
+  '/api/history/clear',
+  async (_req, res): Promise<void> => {
+    try {
+      const username = (await reddit.getCurrentUsername()) || 'anonymous';
+      const historyKey = `history:${username}`;
+      await redis.del(historyKey);
+      console.log(`Cleared play history for ${username}`);
+      res.json({ status: 'success', message: 'History cleared' });
+    } catch (error) {
+      console.error('Error clearing history:', error);
+      res.status(500).json({
+        status: 'error',
+        message: error instanceof Error ? error.message : 'Failed to clear history',
+      });
+    }
+  }
+);
+
+/**
+ * Delete a single entry from play history
+ */
+router.post<unknown, { status: string; message: string }, { puzzleId: string }>(
+  '/api/history/delete',
+  async (req, res): Promise<void> => {
+    try {
+      const { puzzleId } = req.body;
+      if (!puzzleId) {
+        res.status(400).json({ status: 'error', message: 'puzzleId is required' });
+        return;
+      }
+      const username = (await reddit.getCurrentUsername()) || 'anonymous';
+      const historyKey = `history:${username}`;
+      const existingJson = await redis.get(historyKey);
+      const history: PlayHistoryEntry[] = existingJson ? JSON.parse(existingJson) : [];
+      const filtered = history.filter((e) => e.puzzleId !== puzzleId);
+      await redis.set(historyKey, JSON.stringify(filtered));
+      console.log(`Deleted history entry ${puzzleId} for ${username}`);
+      res.json({ status: 'success', message: 'Entry deleted' });
+    } catch (error) {
+      console.error('Error deleting history entry:', error);
+      res.status(500).json({
+        status: 'error',
+        message: error instanceof Error ? error.message : 'Failed to delete entry',
       });
     }
   }
