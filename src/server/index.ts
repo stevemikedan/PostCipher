@@ -200,6 +200,43 @@ router.post<unknown, { status: string; message: string; fixedCount: number }>(
 );
 
 /**
+ * Completely reset the library to only curated real posts.
+ * Deletes all existing posts and re-initializes from puzzle-library.ts
+ */
+router.post<unknown, { status: string; message: string; count: number }>(
+  '/api/admin/reset-library',
+  async (_req, res): Promise<void> => {
+    try {
+      // Delete existing library
+      await redis.del('postcipher:posts:all');
+      await redis.del('postcipher:posts:count');
+      await redis.del('postcipher:daily:used');
+      
+      // Re-initialize from curated posts
+      await initializePostDatabase();
+      
+      // Get new count
+      const { getPostCount } = await import('./services/post-database');
+      const count = await getPostCount();
+      
+      console.log(`Reset library to ${count} curated posts`);
+      res.json({ 
+        status: 'success', 
+        message: `Library reset to ${count} curated real posts`,
+        count 
+      });
+    } catch (error) {
+      console.error('Error resetting library:', error);
+      res.status(500).json({
+        status: 'error',
+        message: error instanceof Error ? error.message : 'Failed to reset library',
+        count: 0,
+      });
+    }
+  }
+);
+
+/**
  * Export library posts in TypeScript format for curated library
  * Call this to get posts ready to paste into puzzle-library.ts
  */
